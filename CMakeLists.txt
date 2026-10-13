@@ -1,104 +1,54 @@
-cmake_minimum_required(VERSION 3.8)
-project(lidar_perception_system)
-
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
+cmake_minimum_required(VERSION 3.18)
+project(lidar_perception_system LANGUAGES C CXX CUDA)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CUDA_STANDARD 17)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
-
-# Find ROS 2 dependencies
 find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
-find_package(tf2_geometry_msgs REQUIRED)
-find_package(tf2_sensor_msgs REQUIRED)
-find_package(pcl_conversions REQUIRED)
-find_package(pcl_ros REQUIRED)
-find_package(ament_index_cpp REQUIRED)
+find_package(tf2_msgs REQUIRED)
+find_package(CUDAToolkit REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(nlohmann_json REQUIRED)
 
-# Find PCL
-find_package(PCL REQUIRED COMPONENTS common io filters segmentation search kdtree)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/MovingBucketTrack.msg"
+  DEPENDENCIES std_msgs builtin_interfaces geometry_msgs)
 
-include_directories(
-  include
-  ${PCL_INCLUDE_DIRS}
-)
+add_library(cuda_grid STATIC src/cuda_grid.cu)
+target_include_directories(cuda_grid PUBLIC include)
+target_link_libraries(cuda_grid PUBLIC CUDA::cudart)
+set_target_properties(cuda_grid PROPERTIES CUDA_SEPARABLE_COMPILATION ON POSITION_INDEPENDENT_CODE ON)
 
-add_definitions(${PCL_DEFINITIONS})
+add_executable(moving_bucket_detector src/moving_bucket_detector.cpp)
+target_include_directories(moving_bucket_detector PRIVATE include)
+ament_target_dependencies(moving_bucket_detector
+  rclcpp sensor_msgs geometry_msgs diagnostic_msgs visualization_msgs tf2 tf2_ros tf2_msgs)
+target_link_libraries(moving_bucket_detector cuda_grid Eigen3::Eigen nlohmann_json::nlohmann_json)
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(moving_bucket_detector ${cpp_typesupport_target})
 
-# Static Object Detector node
-add_executable(static_obj_detector src/static_obj_detector.cpp)
-ament_target_dependencies(static_obj_detector
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  visualization_msgs
-  tf2
-  tf2_ros
-  tf2_geometry_msgs
-  tf2_sensor_msgs
-  pcl_conversions
-  pcl_ros
-)
-target_link_libraries(static_obj_detector ${PCL_LIBRARIES})
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(support_tracker_test test/support_tracker_test.cpp)
+  target_include_directories(support_tracker_test PRIVATE include)
+  target_link_libraries(support_tracker_test Eigen3::Eigen)
+  add_test(NAME support_tracker_test COMMAND support_tracker_test)
+endif()
 
-# Dynamic Object Detector node
-add_executable(dynamic_obj_detector src/dynamic_obj_detector.cpp)
-ament_target_dependencies(dynamic_obj_detector
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  visualization_msgs
-  tf2
-  tf2_ros
-  tf2_geometry_msgs
-  tf2_sensor_msgs
-  pcl_conversions
-  pcl_ros
-  ament_index_cpp
-)
-target_link_libraries(dynamic_obj_detector ${PCL_LIBRARIES})
-
-# Dummy Cloud Publisher for testing
-add_executable(dummy_cloud_publisher src/dummy_cloud_publisher.cpp)
-ament_target_dependencies(dummy_cloud_publisher
-  rclcpp
-  sensor_msgs
-  geometry_msgs
-  tf2_ros
-  pcl_conversions
-  pcl_ros
-)
-target_link_libraries(dummy_cloud_publisher ${PCL_LIBRARIES})
-
-# CAD-precise field map generator
-add_executable(generate_cad_map src/generate_cad_map.cpp)
-target_link_libraries(generate_cad_map ${PCL_LIBRARIES})
-
-# Install executables
-install(TARGETS
-  static_obj_detector
-  dynamic_obj_detector
-  dummy_cloud_publisher
-  generate_cad_map
-  DESTINATION lib/${PROJECT_NAME}
-)
-
-# Install include headers
-install(DIRECTORY include/
-  DESTINATION include
-)
-
-# Install launch, config, maps, and rviz directories
-install(DIRECTORY launch config maps rviz
-  DESTINATION share/${PROJECT_NAME}
-)
-
+install(TARGETS moving_bucket_detector DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/replay_static_tf.py DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY launch config rviz DESTINATION share/${PROJECT_NAME})
+ament_export_dependencies(rosidl_default_runtime)
 ament_package()
