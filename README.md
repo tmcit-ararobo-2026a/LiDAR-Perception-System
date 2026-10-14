@@ -17,6 +17,8 @@ source install/setup.bash
 
 `CMAKE_CUDA_ARCHITECTURES`は対象機のGPUに合わせて指定してください。開発機のRTX 4060 Laptop GPUでは`89`を使用しました。Jetsonの型番を確認せずに`89`を流用しないでください。
 
+GPUなしで鮮度監視ノードとCPU試験だけをビルドする場合は、`--cmake-args -DBUILD_GPU_NODES=OFF`を指定します。ROS型とCPUの`support_tracker_test`だけをビルドする場合は`-DBUILD_RUNTIME_NODES=OFF`を指定できます。
+
 ## 実機で使う
 
 先にMid-360のドライバと自己位置推定を起動し、`/livox/lidar`と点群時刻に対応する`map → センサフレーム`のTFが配信されていることを確認します。別のターミナルで以下を実行します。
@@ -27,7 +29,7 @@ source ~/ros2_ws/install/setup.bash
 ros2 launch lidar_perception_system moving_bucket_rviz.launch.py
 ```
 
-このlaunchは検出ノードとRViz2を**両方**起動します。検出だけを動かす場合は`moving_bucket.launch.py`を使用し、同じ検出ノードを二重起動しないでください。設定は[config/moving_bucket.json](config/moving_bucket.json)です。入力トピックや座標系が異なる場合は設定ファイルをコピーして変更し、`config_file:=/absolute/path/to/moving_bucket.json`をlaunch引数に渡します。
+このlaunchは検出ノード・鮮度監視ノード・RViz2を起動します。RViz2なしで検出・鮮度監視を動かす場合は`moving_bucket.launch.py`を使用し、同じ検出ノードを二重起動しないでください。設定は[config/moving_bucket.json](config/moving_bucket.json)です。入力トピックや座標系が異なる場合は設定ファイルをコピーして変更し、`config_file:=/absolute/path/to/moving_bucket.json`をlaunch引数に渡します。
 
 ## 大会bagをRViz2で確認する
 
@@ -79,11 +81,20 @@ ros2 topic echo /moving_bucket_detector/diagnostics --once
 
 ## 出力
 
+- `/moving_bucket_detector/target_raw`: GPU検出ノードが公開する監視前の追跡結果。
 - `/moving_bucket_detector/target`: `lidar_perception_system/msg/MovingBucketTrack`。位置、速度、共分散、観測状態、validを含みます。
 - `/moving_bucket_detector/diagnostics`: 入力件数、処理件数、TF待ち超過、キュー破棄、処理異常、処理時間のp95・最大値、TF待ち時間のp95。
 - `map → moving_bucket` TF: 設定で有効化した場合、直接観測時のみ配信します。
 
 `observation_mode=SUPPORT_INFERRED`はバケツ本体が直接見えていないことを表します。現在の`support_target_z=1.2 m`は大会bagによる暫定値であり、実物の支持部と開口中心の関係を実測するまで、Zを高精度な観測値として扱わないでください。`confidence`は校正された確率ではありません。`valid=false`の場合は古い位置を照準に使わないでください。
+
+### 追跡結果の鮮度監視
+
+CUDA検出ノードの`/moving_bucket_detector/target_raw`をCPUの`track_freshness_guard_node`が検査し、`/moving_bucket_detector/target`と任意の対象TFを配信します。`moving_bucket.launch.py`は両ノードを起動します。
+
+入力点群・追跡結果・最終観測の時刻、受信からの単調期限、有限値・共分散・観測状態を確認します。GPU計算停止や入力断でも20ms周期で無効結果を公開し、古い結果や重複結果では期限を延長しません。配信時に元のstampを更新せず、対象TFは直接観測時だけ配信します。
+
+入力・追跡結果の期限は既定で0.3秒です。JSONの`tracking.input_timeout_s`・`tracking.track_timeout_s`やROSパラメータで変更できます。固定対象TFの除外接続、静止時の捕捉、認識精度と期限の妥当性は、実際の地図・bag・実機で確認してください。
 
 ## 検証
 
@@ -96,28 +107,4 @@ python3 scripts/benchmark_cuda.py /path/to/rosbag_directory --offset 0 --seconds
 
 ベンチマークにはrosbagディレクトリまたは`.db3`ファイルを直接指定できます。`--offset`は記録開始からの秒数です。`--include-traces`を付けると全座標履歴を出力するため、生成ファイルは機密の大会データとして扱ってください。比較対象の`/opponent_robot/bucket_target`は既存アルゴリズムの結果で、正解ラベルではありません。精度の合否には、映像や実測位置に基づく別の正解データが必要です。精度を評価するときは観測不能な区間とTF欠落区間を分けて集計してください。
 
-## 型生成とCUDAノードの分離（T01）
-
-`-DBUILD_RUNTIME_NODES=OFF` ではCUDA compiler/runtimeを要求せず、MovingBucketTrackの型と
-CPU support_tracker_testをビルドできる。型生成だけでGPUノードを起動する必要はない。
-実行ノードのビルドはCUDA Toolkitを必要とし、`-DCMAKE_CUDA_ARCHITECTURES=<対象GPUの値>` を明示する。
-この環境のdriver/GPU実行は未確認で、型・コンパイル成功は認識精度・GPU動作の証拠ではない。
-
-2026-10-14の検証: Humbleで型のみ（BUILD_RUNTIME_NODES=OFF）とCUDA実行ノード（SM87指定）のビルドに成功。
-LPSの既存CPU support_tracker_testも成功。初回runtimeビルドではMPI wrapperのsocket初期化が
-sandboxで拒否されheader検出に失敗したため、クリーンなbuild-gpuでsandbox外から再実行して成功。
-GPU driverはnvidia-smiで通信失敗。GPUノードの実行・bag・精度・実機は未実施。
-
-## 独立したTrack鮮度監視（T11）
-
-CUDA detectorは `/moving_bucket_detector/target_raw` を配信し、CPUの
-`track_freshness_guard_node` が従来の `/moving_bucket_detector/target` と任意の対象TFを所有する。
-launchは両ノードを起動する。GPU計算停止・入力断・古いキュー結果・重複結果で有効期限を延長しない。
-新しい入力・Track結果と最終観測のstamp、受信からの単調期限、有限値・共分散・認識modeを検査する。
-無通信でも20ms周期でinvalidを公開する。期限切れ後に古い結果や同じstampで復帰しない。
-有効結果のstampは再配信でも更新せず、DIRECTだけでTFを配信する。
-
-期限の既定は既存max_prediction_s（0.3秒）を使う初期設計値。
-JSONのtracking.input_timeout_s/track_timeout_sやROSパラメータで変更でき、実機調整は未実施。
-`-DBUILD_GPU_NODES=OFF` でCUDAを要求せずCPU guardと模擬試験をビルドできる。
-固定対象TFとの除外接続・静止捕捉・認識精度はT09設定とGPU/bagの受入が必要で未完了。
+CPU監視の試験結果は[追跡鮮度の検証記録](docs/track_freshness_verification.md)を参照してください。GPUノードのビルド成功と、実際の認識精度・GPU動作は別に検証します。
