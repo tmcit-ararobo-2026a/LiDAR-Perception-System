@@ -95,3 +95,15 @@ python3 scripts/benchmark_cuda.py /path/to/rosbag_directory --offset 0 --seconds
 ```
 
 ベンチマークにはrosbagディレクトリまたは`.db3`ファイルを直接指定できます。`--offset`は記録開始からの秒数です。`--include-traces`を付けると全座標履歴を出力するため、生成ファイルは機密の大会データとして扱ってください。比較対象の`/opponent_robot/bucket_target`は既存アルゴリズムの結果で、正解ラベルではありません。精度の合否には、映像や実測位置に基づく別の正解データが必要です。精度を評価するときは観測不能な区間とTF欠落区間を分けて集計してください。
+
+## 型生成とCUDAノードの分離（T01）
+
+`-DBUILD_RUNTIME_NODES=OFF` ではCUDA compiler/runtimeを要求せず、MovingBucketTrackの型と
+CPU support_tracker_testをビルドできる。型生成だけでGPUノードを起動する必要はない。
+実行ノードのビルドはCUDA Toolkitを必要とし、`-DCMAKE_CUDA_ARCHITECTURES=<対象GPUの値>` を明示する。
+この環境のdriver/GPU実行は未確認で、型・コンパイル成功は認識精度・GPU動作の証拠ではない。
+
+2026-10-14の検証: Humbleで型のみ（BUILD_RUNTIME_NODES=OFF）とCUDA実行ノード（SM87指定）のビルドに成功。
+LPSの既存CPU support_tracker_testも成功。初回runtimeビルドではMPI wrapperのsocket初期化が
+sandboxで拒否されheader検出に失敗したため、クリーンなbuild-gpuでsandbox外から再実行して成功。
+GPU driverはnvidia-smiで通信失敗。GPUノードの実行・bag・精度・実機は未実施。

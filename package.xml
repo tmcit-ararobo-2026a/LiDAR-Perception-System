@@ -19,6 +19,11 @@
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_msgs</depend>
+  <depend>eigen</depend>
+  <depend>nlohmann-json-dev</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rosbag2_py</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <export><build_type>ament_cmake</build_type></export>
