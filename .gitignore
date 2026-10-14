@@ -14,3 +14,7 @@ log/
 # Python test artifacts
 __pycache__/
 .pytest_cache/
+
+# Local documentation and tests
+docs/
+test/

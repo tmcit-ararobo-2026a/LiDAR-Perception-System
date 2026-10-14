@@ -107,4 +107,4 @@ python3 scripts/benchmark_cuda.py /path/to/rosbag_directory --offset 0 --seconds
 
 ベンチマークにはrosbagディレクトリまたは`.db3`ファイルを直接指定できます。`--offset`は記録開始からの秒数です。`--include-traces`を付けると全座標履歴を出力するため、生成ファイルは機密の大会データとして扱ってください。比較対象の`/opponent_robot/bucket_target`は既存アルゴリズムの結果で、正解ラベルではありません。精度の合否には、映像や実測位置に基づく別の正解データが必要です。精度を評価するときは観測不能な区間とTF欠落区間を分けて集計してください。
 
-CPU監視の試験結果は[追跡鮮度の検証記録](docs/track_freshness_verification.md)を参照してください。GPUノードのビルド成功と、実際の認識精度・GPU動作は別に検証します。
+CPUのsupport_tracker_testはリポジトリに含まれます。鮮度監視の追加試験はローカルのファイルがある場合だけ登録します。GPUノードのビルド成功と、実際の認識精度・GPU動作は別に検証します。

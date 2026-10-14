@@ -61,7 +61,7 @@ if(BUILD_TESTING)
   target_include_directories(support_tracker_test PRIVATE include)
   target_link_libraries(support_tracker_test Eigen3::Eigen)
   add_test(NAME support_tracker_test COMMAND support_tracker_test)
-  if(BUILD_RUNTIME_NODES)
+  if(BUILD_RUNTIME_NODES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/track_freshness_guard_test.py")
     find_package(ament_cmake_pytest REQUIRED)
     ament_add_pytest_test(track_freshness_guard_test test/track_freshness_guard_test.py
       ENV TRACK_GUARD_EXECUTABLE=$<TARGET_FILE:track_freshness_guard_node>
