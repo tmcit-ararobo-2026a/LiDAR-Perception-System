@@ -107,3 +107,17 @@ CPU support_tracker_testをビルドできる。型生成だけでGPUノード�
 LPSの既存CPU support_tracker_testも成功。初回runtimeビルドではMPI wrapperのsocket初期化が
 sandboxで拒否されheader検出に失敗したため、クリーンなbuild-gpuでsandbox外から再実行して成功。
 GPU driverはnvidia-smiで通信失敗。GPUノードの実行・bag・精度・実機は未実施。
+
+## 独立したTrack鮮度監視（T11）
+
+CUDA detectorは `/moving_bucket_detector/target_raw` を配信し、CPUの
+`track_freshness_guard_node` が従来の `/moving_bucket_detector/target` と任意の対象TFを所有する。
+launchは両ノードを起動する。GPU計算停止・入力断・古いキュー結果・重複結果で有効期限を延長しない。
+新しい入力・Track結果と最終観測のstamp、受信からの単調期限、有限値・共分散・認識modeを検査する。
+無通信でも20ms周期でinvalidを公開する。期限切れ後に古い結果や同じstampで復帰しない。
+有効結果のstampは再配信でも更新せず、DIRECTだけでTFを配信する。
+
+期限の既定は既存max_prediction_s（0.3秒）を使う初期設計値。
+JSONのtracking.input_timeout_s/track_timeout_sやROSパラメータで変更でき、実機調整は未実施。
+`-DBUILD_GPU_NODES=OFF` でCUDAを要求せずCPU guardと模擬試験をビルドできる。
+固定対象TFとの除外接続・静止捕捉・認識精度はT09設定とGPU/bagの受入が必要で未完了。
