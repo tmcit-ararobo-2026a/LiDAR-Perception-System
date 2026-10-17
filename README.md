@@ -1,6 +1,8 @@
 # LiDAR Perception System
 
-ROS 2 HumbleとCUDAを使う、相手の移動バケツ専用のLiDAR認識パッケージです。入力はLivox Mid-360等の`PointCloud2`と時刻対応の`map → base_link → センサ` TFです。点群の変換と高さ別グリッド集計をGPUで行い、支持部の候補を追跡します。
+ROS 2 Humbleを使う、相手の移動バケツ専用のLiDAR認識パッケージです。従来のCUDA支持部追跡に加えて、CPUで相手座標系に点群を蓄積して開口中心を推定する初期実装を含みます。以下の従来方式と、新方式の専用launchは別々に起動できます。
+
+従来方式はCUDAを使います。入力はLivox Mid-360等の`PointCloud2`と時刻対応の`map → base_link → センサ` TFです。点群の変換と高さ別グリッド集計をGPUで行い、支持部の候補を追跡します。
 
 固定バケツ・旗の認識、PCL、背景PCD、KD-tree背景差分、中間点群の配信は使用しません。既知の固定設備のTFがある場合は、その周辺を候補から除外します。
 
@@ -17,7 +19,7 @@ source install/setup.bash
 
 `CMAKE_CUDA_ARCHITECTURES`は対象機のGPUに合わせて指定してください。開発機のRTX 4060 Laptop GPUでは`89`を使用しました。Jetsonの型番を確認せずに`89`を流用しないでください。
 
-GPUなしで鮮度監視ノードとCPU試験だけをビルドする場合は、`--cmake-args -DBUILD_GPU_NODES=OFF`を指定します。ROS型とCPUの`support_tracker_test`だけをビルドする場合は`-DBUILD_RUNTIME_NODES=OFF`を指定できます。
+GPUなしで新しい開口追跡ノード・鮮度監視ノード・CPU試験をビルドする場合は、`--cmake-args -DBUILD_GPU_NODES=OFF`を指定します。ROS型とCPUの`support_tracker_test`だけをビルドする場合は`-DBUILD_RUNTIME_NODES=OFF`を指定できます。
 
 ## 実機で使う
 
@@ -108,3 +110,90 @@ python3 scripts/benchmark_cuda.py /path/to/rosbag_directory --offset 0 --seconds
 ベンチマークにはrosbagディレクトリまたは`.db3`ファイルを直接指定できます。`--offset`は記録開始からの秒数です。`--include-traces`を付けると全座標履歴を出力するため、生成ファイルは機密の大会データとして扱ってください。比較対象の`/opponent_robot/bucket_target`は既存アルゴリズムの結果で、正解ラベルではありません。精度の合否には、映像や実測位置に基づく別の正解データが必要です。精度を評価するときは観測不能な区間とTF欠落区間を分けて集計してください。
 
 CPUのsupport_tracker_testはリポジトリに含まれます。鮮度監視の追加試験はローカルのファイルがある場合だけ登録します。GPUノードのビルド成功と、実際の認識精度・GPU動作は別に検証します。
+
+
+## 新方式：相手座標系での点群蓄積と開口中心推定
+
+`bucket_opening_tracker`は、設定した範囲内の相手クラスタを捕捉し、車体下部の平面ICPから位置・回転を推定します。各フレームの3次元点を相手座標系へ変換し、直近1秒を蓄積して、水平なバケツ開口上端の円・円弧を探します。出力の位置は、支持部重心ではなく**開口面上の円中心**です。
+
+CPUとEigenで動作し、PCL・ESDF・事前PCDは使いません。初期版はbagで検証するための構成で、実機の照準・射出への接続はしていません。セッティング専用の学習操作は不要です。
+
+### 設定と起動
+
+GPUを使わないビルド例です。CUDA方式もビルドする場合は`BUILD_GPU_NODES=OFF`を省いて、対象GPUのarchitectureを指定してください。
+
+```bash
+cd ~/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select lidar_perception_system --cmake-args -DBUILD_GPU_NODES=OFF
+source install/setup.bash
+cp src/LiDAR-Perception-System/config/bucket_opening.json /tmp/bucket_opening.json
+```
+
+`/tmp/bucket_opening.json`の`opponent_roi`を、RViz上の`map`座標で相手を探索するXY矩形へ変更します。配布テンプレートの`null`は意図的な未設定値で、そのままでは検出ノードは起動エラーになります。次は書式例であり、実フィールドの設定値ではありません。
+
+```json
+"opponent_roi": {"min_x": -2.0, "max_x": 2.0, "min_y": 1.0, "max_y": 5.0}
+```
+
+LiDAR入力と点群時刻のTFがある状態で起動します。
+
+```bash
+ros2 launch lidar_perception_system bucket_opening_rviz.launch.py config_file:=/tmp/bucket_opening.json
+```
+
+RVizなしでは`bucket_opening.launch.py`を使います。bag途中再生の例は次のとおりです。`bag_path`は固定TFを事前配信するための引数です。動的TFはbagの記録値を使う例なので、自己位置推定による同じTFの再計算とは同時に行いません。
+
+```bash
+ros2 launch lidar_perception_system bucket_opening_rviz.launch.py config_file:=/tmp/bucket_opening.json use_sim_time:=true bag_path:=/absolute/path/to/bag
+ros2 bag play /absolute/path/to/bag --clock --start-offset 936 --topics /livox/lidar /tf /tf_static
+```
+
+上の2コマンドは別ターミナルで実行します。新しい端末ではROSとworkspaceのsetupをsourceしてください。
+
+### 判定と追跡
+
+- 初期捕捉に相手の移動は不要です。既知の`desk_*`・`bucket_*`・`flag_*`固定TF周辺を初期候補から除き、上方の開口形状も候補選択に使います。候補が曖昧なら確定しません。
+- 捕捉後は予測した車体領域を回収して平面ICPを行います。疎なスキャンで車体が複数クラスタに割れても、毎回のクラスタ重心へ座標原点を置き直しません。
+- 開口は高さ1.2〜2.1m、半径110〜150mmで探索します。公称外径からの半径136.5mmは仮説であり、開口内径の実測値ではありません。
+- 初期条件は異なる12ボクセル以上、円弧120度以上、半径方向残差15mm以下、上面の高さ残差4mm以下です。側面が上に続く断面を除き、ふちの半径方向の広がり3mm以上と、最新フレームの支持点も要求します。
+- 3観測で確定します。蓄積した過去点だけでは観測時刻を更新しません。欠測時は観測できた車体姿勢で学習済みの水平取付位置を変換し、`PREDICTED`として扱います。予測は0.3秒までで、古い結果は別CPUノードの鮮度監視でも無効になります。
+- 高さが3cmを超えて変化したら開口付近の蓄積を破棄し、再確定するまで無効にします。車体の蓄積は維持します。昇降中の連続追跡・昇降速度推定は行いません。
+- 開口を確認できない初期候補を永久に保持しないよう、2秒で探索をやり直します。初期捕捉の失敗位置は短時間だけ候補から外します。追跡のリセットでは新しいIDを割り当てます。
+
+JSONの`filter`・`robot`・`accumulation`・`registration`・`opening`・`tracking`で各条件を変更できます。距離はm、時間は秒、円弧角はradです。設定値には有限値・範囲・計算量上限の検査があります。
+
+### 出力とRViz
+
+| 名前 | 内容 |
+| --- | --- |
+| `/bucket_opening_tracker/target_raw` | 監視前の`MovingBucketTrack` |
+| `/bucket_opening_tracker/target` | 独立CPU監視後の開口中心・水平速度・不確かさ・valid |
+| `/bucket_opening_tracker/selected_cloud` | 選択した相手領域の最新3次元点群（map座標） |
+| `/bucket_opening_tracker/accumulated_cloud` | 相手運動を補償した蓄積点群を現在のmap座標へ戻したもの |
+| `/bucket_opening_tracker/markers` | 監視後の開口円・中心・速度・状態 |
+| `/bucket_opening_tracker/robot_markers` | 相手局所座標の軸 |
+| `/bucket_opening_tracker/diagnostics` | 処理件数・候補数・ICPの残差／対応率・蓄積点数・開口仮説の各段階・処理時間 |
+| `map → lps_opponent_<id>` | 車体姿勢を観測できた時刻の局所座標TF |
+
+`DIRECT`は最新点にも裏付けられた開口推定、`PREDICTED`は新しい開口観測のない短期予測です。支持部からの固定高さ出力はしません。新方式の`support_points`は最新フレームで開口円を支持した点数です。開口の緑／青マーカーは監視後の結果から作り、無効時は削除します。点群と座標軸は検出過程の可視化で、有効な照準結果とは区別してください。
+
+対象TFは既定で無効です。JSONの`publish_tf`を有効にすると、新方式のguardは`map → bucket_opening`を直接観測時だけ配信します。旧方式の`moving_bucket`とは別名です。guardの`child_frame`パラメータの既定値は従来どおり`moving_bucket`です。
+
+### bagでの比較
+
+```bash
+ros2 run lidar_perception_system benchmark_opening.py /absolute/path/to/bag --config /tmp/bucket_opening.json --offset 936 --seconds 60 --output /tmp/opening_report.json
+```
+
+旧CUDA方式と同じ入力で比較する場合は、`--baseline-executable /absolute/path/to/moving_bucket_detector`を追加します。必要なら`--baseline-config`も指定します。CPUのみのinstallには旧GPU実行ファイルがないため、比較には別途ビルド済みの実行ファイルが必要です。
+
+スクリプトは専用のlocalhost ROS domainで再生し、自分が起動したプロセスだけを終了します。JSONへ処理時間、直接観測・予測・無効の件数、監視後に通過した計測数、無効理由を保存します。guardによる同じ計測時刻の再配信は有効計測数へ重複計上しません。`opening_confirmed`は実行区間で開口を確定できたかを表します。スクリプトの正常終了は再生・処理の成功であり、開口の正しさや精度の合格ではありません。座標履歴は出力しません。
+
+### 制約と検証範囲
+
+フレーム間の平面運動を補償する初期版です。スキャン内部の移動、上下動・大きな傾き、疎な／対称な形状による姿勢の曖昧さは残ります。1方向からの蓄積で未観測の裏側は復元できません。薄い・透明なふちで十分な上端点が得られない場合も、車体重心で代替せず無効になります。
+
+合成点群では開口中心、部分円弧、並進・回転、静止捕捉、欠測、昇降後の再捕捉、候補の取り違え、時刻異常を検証します。追加の合成／ROS結合試験はローカルファイルがある場合だけCMakeへ登録し、既存方針に従ってGit管理から除外します。実データの絶対精度や実機での認識率は未受入です。`confidence`は校正された確率ではありません。
+
+手元の実bagで936秒から180秒間を再生した検証では、処理エラー・キュー破棄は0件でしたが、開口確定も0件でした。この初期版は実データでの開口認識が未達です。相手クラスタの対応と開口点の可観測性を確認する必要があり、ビルド・合成試験の成功を実bagでの認識成功とは扱いません。

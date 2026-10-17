@@ -45,6 +45,12 @@ struct Opening {
   int points{0}, current_points{0};
 };
 
+struct FitStats {
+  int max_slice_points{0}, radius_hypotheses{0}, geometry_hypotheses{0}, edge_hypotheses{0};
+  int max_inliers{0};
+  double max_arc{0};
+};
+
 struct Result {
   bool valid{false}, predicted{false}, body_valid{false};
   unsigned int track_id{0};
@@ -55,6 +61,7 @@ struct Result {
   std::string reason{"no target"};
   int candidates{0}, model_points{0};
   double registration_rmse{0}, overlap{0};
+  FitStats fit;
 };
 
 // Core has no ROS/GPU dependencies. All times are measurement times in seconds.
@@ -68,7 +75,8 @@ class Tracker {
   const Points& accumulated_cloud() const { return accumulated_; }
   const Points& body_model() const { return reference_body_; }
   unsigned int height_resets() const { return height_resets_; }
-  std::optional<Opening> fit_opening(const Points& accumulated, const Points& current) const;
+  std::optional<Opening> fit_opening(const Points& accumulated, const Points& current,
+                                     FitStats* stats = nullptr) const;
 
  private:
   struct Cluster {
@@ -92,6 +100,8 @@ class Tracker {
   Pose pose_;
   Eigen::Vector2d body_velocity_{0, 0}, cluster_center_{0, 0};
   double yaw_rate_{0}, body_stamp_{0}, input_stamp_{-1};
+  double acquired_stamp_{0}, rejection_until_{0};
+  std::optional<Eigen::Vector2d> rejected_center_;
   bool have_body_{false}, confirmed_{false}, height_pending_{false};
   int hits_{0};
   unsigned int next_id_{0}, track_id_{0}, height_resets_{0};

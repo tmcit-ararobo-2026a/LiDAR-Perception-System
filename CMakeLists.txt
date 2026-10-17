@@ -94,7 +94,8 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-install(PROGRAMS scripts/replay_static_tf.py DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/replay_static_tf.py scripts/benchmark_opening.py
+  DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY launch config rviz DESTINATION share/${PROJECT_NAME})
 ament_export_dependencies(rosidl_default_runtime)
 ament_package()

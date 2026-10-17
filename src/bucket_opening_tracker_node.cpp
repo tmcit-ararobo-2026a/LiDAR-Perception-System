@@ -208,6 +208,11 @@ class BucketOpeningTracker : public rclcpp::Node {
   };
   void receive(Cloud::ConstSharedPtr cloud) {
     ++received_;
+    if (cloud->data.size() > static_cast<size_t>(max_bytes_)) {
+      ++errors_;
+      invalid(cloud->header, "PointCloud2 exceeds input capacity");
+      return;
+    }
     if (cloud->header.stamp.sec < 0 || cloud->header.stamp.nanosec >= 1000000000U) {
       ++errors_;
       return;
@@ -317,6 +322,11 @@ class BucketOpeningTracker : public rclcpp::Node {
       const auto& t = transform.transform.translation;
       const double stamp = rclcpp::Time(item.cloud->header.stamp).seconds();
       last_result_ = tracker_->process(points, stamp, {t.x, t.y});
+      body_frames_ += last_result_.body_valid;
+      radius_frames_ += last_result_.fit.radius_hypotheses > 0;
+      geometry_frames_ += last_result_.fit.geometry_hypotheses > 0;
+      edge_frames_ += last_result_.fit.edge_hypotheses > 0;
+      fresh_rim_frames_ += last_result_.opening.has_value() && !last_result_.predicted;
       if (last_result_.observation_stamp == stamp && last_result_.opening &&
           !last_result_.predicted) {
         last_observation_ = item.cloud->header.stamp;
@@ -519,9 +529,20 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("registration_rmse", last_result_.registration_rmse);
     add("registration_overlap", last_result_.overlap);
     add("height_resets", tracker_->height_resets());
+    add("body_registered_frames", body_frames_);
+    add("rim_radius_frames", radius_frames_);
+    add("rim_geometry_frames", geometry_frames_);
+    add("rim_edge_frames", edge_frames_);
+    add("rim_fresh_frames", fresh_rim_frames_);
     add("rim_points", last_result_.opening ? last_result_.opening->points : 0);
     add("rim_arc", last_result_.opening ? last_result_.opening->arc : 0);
     add("rim_residual", last_result_.opening ? last_result_.opening->residual : 0);
+    add("rim_max_slice_points", last_result_.fit.max_slice_points);
+    add("rim_max_inliers", last_result_.fit.max_inliers);
+    add("rim_max_arc", last_result_.fit.max_arc);
+    add("rim_radius_hypotheses", last_result_.fit.radius_hypotheses);
+    add("rim_geometry_hypotheses", last_result_.fit.geometry_hypotheses);
+    add("rim_edge_hypotheses", last_result_.fit.edge_hypotheses);
     if (!timings_.empty()) {
       std::vector<double> sorted(timings_.begin(), timings_.end());
       std::sort(sorted.begin(), sorted.end());
@@ -544,6 +565,8 @@ class BucketOpeningTracker : public rclcpp::Node {
   std::map<std::string, Eigen::Vector3d> exclusions_;
   uint64_t received_{0}, processed_{0}, observed_{0}, predicted_{0}, tf_drops_{0}, queue_drops_{0},
       errors_{0}, duplicates_{0}, rewinds_{0};
+  uint64_t body_frames_{0}, radius_frames_{0}, geometry_frames_{0}, edge_frames_{0},
+      fresh_rim_frames_{0};
   std::unique_ptr<tf2_ros::Buffer> buffer_;
   std::unique_ptr<tf2_ros::TransformListener> listener_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> broadcaster_;

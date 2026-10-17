@@ -10,6 +10,7 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -133,21 +134,22 @@ void Config::validate() const {
     }
   }
   if (min_x >= max_x || min_y >= max_y || min_z >= max_z ||
-      std::max({std::abs(min_x), std::abs(max_x), std::abs(min_y), std::abs(max_y),
+      std::max({std::abs(min_x), std::abs(max_x), std::abs(min_y), std::abs(max_y), std::abs(min_z),
                 std::abs(max_z)}) > 100 ||
       body_min_z < min_z || body_min_z >= body_max_z || body_max_z >= min_opening_z ||
       min_opening_z >= max_opening_z || max_opening_z > max_z || self_radius < 0 ||
       crop_margin < 0 || min_span <= 0 || max_span < min_span || cluster_resolution < 0.01 ||
       body_voxel < 0.005 || opening_voxel < 0.001 || min_radius <= 0 || min_radius >= max_radius ||
-      nominal_radius < min_radius || nominal_radius > max_radius || slice_m <= 0 ||
-      max_residual <= 0 || max_plane_rmse <= 0 || min_arc <= 0 || min_arc > 2 * pi ||
-      height_change_m <= 0 || min_lip_width < 0 || min_lip_width > max_residual || window_s <= 0 ||
-      window_s > 5 || prediction_s <= 0 || prediction_s > reset_s || reset_s > 10 ||
-      correspondence_m <= 0 || correspondence_m > 1 || max_registration_rmse <= 0 ||
-      min_overlap <= 0 || min_overlap > 1 || association_m <= 0 || icp_iterations < 1 ||
-      icp_iterations > 100 || ransac_iterations < 1 || ransac_iterations > 1000 ||
-      min_body_points < 3 || min_rim_points < 3 || min_current_points < 3 || min_side_points < 1 ||
-      confirm_hits < 1 || max_body_points < min_body_points || max_body_points > 20000 ||
+      nominal_radius < min_radius || nominal_radius > max_radius || slice_m < 0.002 ||
+      max_opening_z - min_opening_z > 5 || max_residual <= 0 || max_plane_rmse <= 0 ||
+      min_arc <= 0 || min_arc > 2 * pi || height_change_m <= 0 || min_lip_width < 0 ||
+      min_lip_width > max_residual || window_s <= 0 || window_s > 5 || prediction_s <= 0 ||
+      prediction_s > reset_s || reset_s > 10 || correspondence_m <= 0 || correspondence_m > 1 ||
+      max_registration_rmse <= 0 || min_overlap <= 0 || min_overlap > 1 || association_m <= 0 ||
+      icp_iterations < 1 || icp_iterations > 100 || ransac_iterations < 1 ||
+      ransac_iterations > 1000 || min_body_points < 3 || min_rim_points < 3 ||
+      min_current_points < 3 || min_side_points < 1 || confirm_hits < 1 ||
+      max_body_points < min_body_points || max_body_points > 20000 ||
       max_model_points < max_body_points || max_model_points > 200000 ||
       max_frame_points < max_model_points || max_frame_points > 1000000) {
     throw std::invalid_argument("Invalid opening tracker bounds or limits");
@@ -165,6 +167,9 @@ void Tracker::reset() {
   hits_ = 0;
   last_opening_.reset();
   body_stamp_ = 0;
+  acquired_stamp_ = 0;
+  rejection_until_ = 0;
+  rejected_center_.reset();
   input_stamp_ = -1;
   observation_stamp_ = 0;
   body_velocity_.setZero();
@@ -325,7 +330,9 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
   return true;
 }
 
-std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& current) const {
+std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& current,
+                                            FitStats* stats) const {
+  if (stats) *stats = FitStats{};
   const auto points = voxelize(input, cfg_.opening_voxel, cfg_.max_model_points);
   std::optional<Opening> best;
   std::mt19937 rng(0x20261018);
@@ -336,6 +343,8 @@ std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& c
         slice.push_back(i);
       }
     }
+    if (stats)
+      stats->max_slice_points = std::max(stats->max_slice_points, static_cast<int>(slice.size()));
     if (static_cast<int>(slice.size()) < cfg_.min_rim_points) {
       continue;
     }
@@ -356,12 +365,15 @@ std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& c
       if (radius < cfg_.min_radius || radius > cfg_.max_radius) {
         continue;
       }
+      if (stats) ++stats->radius_hypotheses;
       std::vector<size_t> inliers;
       for (size_t i : slice) {
         if (std::abs((points[i].head<2>() - center).norm() - radius) <= cfg_.max_residual) {
           inliers.push_back(i);
         }
       }
+      if (stats)
+        stats->max_inliers = std::max(stats->max_inliers, static_cast<int>(inliers.size()));
       if (static_cast<int>(inliers.size()) < cfg_.min_rim_points) {
         continue;
       }
@@ -414,10 +426,12 @@ std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& c
         angles.push_back(std::atan2(d.y(), d.x()));
       }
       const double residual = std::sqrt(sum / inliers.size()), span = arc_span(angles);
+      if (stats) stats->max_arc = std::max(stats->max_arc, span);
       const double plane_rmse = std::sqrt(plane / inliers.size());
       if (residual > cfg_.max_residual || span < cfg_.min_arc || plane_rmse > cfg_.max_plane_rmse) {
         continue;
       }
+      if (stats) ++stats->geometry_hypotheses;
       std::sort(radii.begin(), radii.end());
       // A horizontal lip has radial extent. An isolated wall contour alone is
       // not enough evidence that its highest visible return is the true rim.
@@ -439,6 +453,7 @@ std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& c
       if (below < cfg_.min_side_points || above >= 3) {
         continue;
       }
+      if (stats) ++stats->edge_hypotheses;
       int fresh = 0;
       std::vector<double> fresh_angles;
       for (const auto& p : current) {
@@ -501,8 +516,17 @@ Result Tracker::missing(double stamp, const std::string& reason, Result result) 
     result.valid = true;
     result.predicted = true;
     result.position = position_ + velocity_ * (stamp - observation_stamp_);
+    if (result.body_valid && last_opening_) {
+      // The learned mounting offset rotates with the observed robot. This is
+      // still a prediction: body registration must not renew the rim timestamp.
+      result.position = pose_.world(last_opening_->center);
+      const Point lever = result.position - Point(pose_.xy.x(), pose_.xy.y(), 0);
+      result.velocity = Point(body_velocity_.x() - yaw_rate_ * lever.y(),
+                              body_velocity_.y() + yaw_rate_ * lever.x(), 0);
+    } else {
+      result.velocity = velocity_;
+    }
     result.position.z() = position_.z();
-    result.velocity = velocity_;
     result.opening = last_opening_;
     result.position_variance = variance_ + 0.1 * (stamp - observation_stamp_);
   }
@@ -523,8 +547,17 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     return result;
   }
   input_stamp_ = stamp;
-  if (have_body_ && stamp - body_stamp_ > cfg_.reset_s) {
+  const bool unconfirmed_timeout =
+      have_body_ && !confirmed_ && stamp - acquired_stamp_ > cfg_.reset_s;
+  if (have_body_ && (stamp - body_stamp_ > cfg_.reset_s || unconfirmed_timeout ||
+                     (confirmed_ && stamp - observation_stamp_ > cfg_.reset_s))) {
+    const auto rejected = cluster_center_;
+    const bool reject = unconfirmed_timeout && !height_pending_;
     reset();
+    if (reject) {
+      rejected_center_ = rejected;
+      rejection_until_ = stamp + cfg_.reset_s;
+    }
     input_stamp_ = stamp;
   }
   rebuild(stamp);
@@ -545,6 +578,45 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   auto candidates = clusters(filtered);
   result.candidates = static_cast<int>(candidates.size());
   const double elapsed = have_body_ ? stamp - body_stamp_ : 0;
+  if (have_body_ && !reference_body_.empty()) {
+    // Sparse scans can split a robot into several connected components. Once
+    // acquired, collect its predicted footprint rather than following whichever
+    // fragment happens to have the nearest changing centroid.
+    Pose predicted = pose_;
+    predicted.xy += body_velocity_ * elapsed;
+    predicted.yaw = angle(predicted.yaw + yaw_rate_ * elapsed);
+    Eigen::Vector2d lo = reference_body_.front().head<2>();
+    Eigen::Vector2d hi = lo;
+    for (const auto& p : reference_body_) {
+      lo = lo.cwiseMin(p.head<2>());
+      hi = hi.cwiseMax(p.head<2>());
+    }
+    const double margin = std::min(0.30, 0.10 + 0.20 * elapsed);
+    Cluster tracked;
+    tracked.center.setZero();
+    tracked.min_x = tracked.min_y = std::numeric_limits<double>::infinity();
+    tracked.max_x = tracked.max_y = -tracked.min_x;
+    for (const auto& p : filtered) {
+      const Point local = predicted.local(p);
+      if (p.z() < cfg_.body_min_z || p.z() > cfg_.body_max_z ||
+          (local.head<2>().array() < lo.array() - margin).any() ||
+          (local.head<2>().array() > hi.array() + margin).any()) {
+        continue;
+      }
+      tracked.body.push_back(p);
+      tracked.center += p.head<2>();
+      tracked.min_x = std::min(tracked.min_x, p.x());
+      tracked.max_x = std::max(tracked.max_x, p.x());
+      tracked.min_y = std::min(tracked.min_y, p.y());
+      tracked.max_y = std::max(tracked.max_y, p.y());
+    }
+    candidates.clear();
+    if (static_cast<int>(tracked.body.size()) >= cfg_.min_body_points) {
+      tracked.center /= tracked.body.size();
+      tracked.body = voxelize(tracked.body, cfg_.body_voxel, cfg_.max_body_points);
+      candidates.push_back(std::move(tracked));
+    }
+  }
   const Eigen::Vector2d hint = cluster_center_ + body_velocity_ * elapsed;
   Cluster* chosen = nullptr;
   double best = -1e9, second = -1e9;
@@ -554,6 +626,10 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
     bool excluded = false;
     if (!have_body_) {
+      if (rejected_center_ && stamp < rejection_until_ &&
+          (c.center - *rejected_center_).norm() < 0.4) {
+        continue;
+      }
       for (const auto& mask : exclusions_) {
         if ((c.center - mask.head<2>()).norm() < mask.z()) {
           excluded = true;
@@ -565,15 +641,22 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       continue;
     }
     int upper = 0;
+    Points upper_context;
     for (const auto& p : filtered) {
-      if (p.z() >= cfg_.min_opening_z && p.x() > c.min_x - cfg_.crop_margin &&
+      if (p.z() >= cfg_.min_opening_z - 0.25 && p.x() > c.min_x - cfg_.crop_margin &&
           p.x() < c.max_x + cfg_.crop_margin && p.y() > c.min_y - cfg_.crop_margin &&
           p.y() < c.max_y + cfg_.crop_margin) {
-        ++upper;
+        if (p.z() >= cfg_.min_opening_z) ++upper;
+        if (!have_body_) upper_context.push_back(p);
       }
     }
     double score =
         have_body_ ? -(c.center - hint).norm() : std::log1p(c.body.size()) + std::log1p(upper);
+    if (!have_body_) {
+      if (const auto opening = fit_opening(upper_context, upper_context)) {
+        score += 20 + opening->score;
+      }
+    }
     if (score > best) {
       second = best;
       best = score;
@@ -597,6 +680,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     pose_.yaw = 0;
     updated = pose_;
     have_body_ = true;
+    acquired_stamp_ = stamp;
     track_id_ = ++next_id_;
     result.overlap = 1;
   } else {
@@ -641,6 +725,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     confirmed_ = false;
     hits_ = 0;
     height_pending_ = true;
+    acquired_stamp_ = stamp;
     last_opening_.reset();
     ++height_resets_;
   }
@@ -654,7 +739,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     frames_.pop_front();
   }
   rebuild(stamp);
-  auto opening = fit_opening(accumulated_, upper);
+  auto opening = fit_opening(accumulated_, upper, &result.fit);
   if (opening && last_opening_ &&
       std::abs(opening->center.z() - last_opening_->center.z()) > cfg_.height_change_m) {
     for (auto& previous : frames_) {
@@ -662,10 +747,11 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
     frames_.back().upper = upper;
     rebuild(stamp);
-    opening = fit_opening(accumulated_, upper);
+    opening = fit_opening(accumulated_, upper, &result.fit);
     confirmed_ = false;
     hits_ = 0;
     height_pending_ = true;
+    acquired_stamp_ = stamp;
     last_opening_.reset();
     ++height_resets_;
   }
