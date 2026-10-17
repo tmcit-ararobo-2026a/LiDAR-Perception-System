@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -21,7 +22,19 @@ from lidar_perception_system.msg import MovingBucketTrack
 from sensor_msgs.msg import PointCloud2
 from tf2_msgs.msg import TFMessage
 
-from replay_static_tf import read_static_tf
+from replay_static_tf import databases, read_static_tf
+
+
+def bag_start_ns(path):
+    starts = []
+    for database in databases(path):
+        with sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True) as connection:
+            start = connection.execute('SELECT MIN(timestamp) FROM messages').fetchone()[0]
+            if start is not None:
+                starts.append(start)
+    if not starts:
+        raise ValueError('The bag contains no messages')
+    return min(starts)
 
 
 def stop(process):
@@ -45,21 +58,38 @@ def main():
     parser.add_argument('--config', type=Path, required=True, help='JSON with explicit opponent_roi')
     parser.add_argument('--offset', type=float, default=936.)
     parser.add_argument('--seconds', type=float, default=60.)
+    parser.add_argument('--warmup-seconds', type=float, default=0.,
+                        help='Replay this many seconds before offset, retaining the learned model')
+    parser.add_argument('--recompute-localization', action='store_true',
+                        help='Launch gn10_pointcloud_localization using recorded LiDAR/IMU only')
     parser.add_argument('--baseline-executable', type=Path,
                         help='Optional existing CUDA moving_bucket_detector executable')
     parser.add_argument('--baseline-config', type=Path, default=Path(get_package_share_directory(
         'lidar_perception_system')) / 'config' / 'moving_bucket.json')
     parser.add_argument('--output', type=Path, default=Path('/tmp/lps_opening_benchmark.json'))
     args = parser.parse_args()
-    if (not args.bag.exists() or not math.isfinite(args.offset) or not math.isfinite(args.seconds)
-            or args.offset < 0 or args.seconds <= 0):
-        parser.error('bag must exist, offset must be nonnegative and seconds must be positive')
+    if (not args.bag.exists() or not all(math.isfinite(x) for x in
+            (args.offset, args.seconds, args.warmup_seconds)) or args.offset < 0
+            or args.seconds <= 0 or not 0 <= args.warmup_seconds <= args.offset):
+        parser.error('bag must exist, seconds must be positive, and 0 <= warmup <= offset')
     config = json.loads(args.config.read_text())
     if not isinstance(config.get('opponent_roi'), dict):
         parser.error('config must specify opponent_roi')
     if args.baseline_executable and not args.baseline_executable.is_file():
         parser.error('baseline executable does not exist')
-    static_message = read_static_tf(args.bag)
+    if args.recompute_localization:
+        get_package_share_directory('gn10_pointcloud_localization')
+        static_message = None
+        replay_topics = ['/livox/lidar', '/livox/imu']
+    else:
+        static_message = read_static_tf(args.bag)
+        replay_topics = [config['input_topic'], '/tf', '/tf_static']
+    evaluation_start_ns = bag_start_ns(args.bag) + round(args.offset * 1e9)
+    evaluation_end_ns = evaluation_start_ns + round(args.seconds * 1e9)
+
+    def in_evaluation(stamp):
+        ns = stamp.sec * 10**9 + stamp.nanosec
+        return evaluation_start_ns <= ns < evaluation_end_ns
     run_dir = Path(tempfile.mkdtemp(prefix='lps_opening_'))
     env = os.environ.copy()
     # Each run is isolated from a robot's existing ROS domain and command consumers.
@@ -71,7 +101,8 @@ def main():
     node = rclpy.create_node('opening_benchmark', parameter_overrides=[Parameter('use_sim_time', value=True)])
     static_pub = node.create_publisher(TFMessage, '/tf_static', QoSProfile(
         depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
-    static_pub.publish(static_message)
+    if static_message is not None:
+        static_pub.publish(static_message)
     streams = {}
     diagnostic = {}
     sampled_peaks = {}
@@ -79,7 +110,8 @@ def main():
     subscriptions = []
     cloud_count = [0]
     subscriptions.append(node.create_subscription(PointCloud2, config['input_topic'],
-        lambda _: cloud_count.__setitem__(0, cloud_count[0] + 1), rclpy.qos.qos_profile_sensor_data))
+        lambda m: cloud_count.__setitem__(0, cloud_count[0] + int(in_evaluation(m.header.stamp))),
+        rclpy.qos.qos_profile_sensor_data))
     prefixes = {'opening': '/bucket_opening_tracker'}
     if args.baseline_executable:
         prefixes['baseline'] = '/moving_bucket_detector'
@@ -87,10 +119,14 @@ def main():
         streams[name] = {'raw': {}, 'final_valid': set(), 'final_invalid_reports': 0}
         reasons[name] = Counter()
         def raw(message, name=name):
+            if not in_evaluation(message.header.stamp):
+                return
             stamp = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
             if stamp > 0:
                 streams[name]['raw'][stamp] = (message.valid, message.observation_mode, message.track_id)
         def final(message, name=name):
+            if not in_evaluation(message.header.stamp):
+                return
             if message.valid:
                 stamp = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
                 streams[name]['final_valid'].add(stamp)
@@ -101,7 +137,8 @@ def main():
                 diagnostic[name] = {v.key: v.value for v in status.values}
                 reasons[name][status.message] += 1
                 for key in ('model_points', 'rim_max_slice_points', 'rim_max_inliers', 'rim_max_arc',
-                            'rim_radius_hypotheses', 'rim_geometry_hypotheses', 'rim_edge_hypotheses'):
+                            'rim_radius_hypotheses', 'rim_geometry_hypotheses', 'rim_edge_hypotheses',
+                            'rim_interior_rejections'):
                     if key in diagnostic[name]:
                         value = float(diagnostic[name][key])
                         peaks = sampled_peaks.setdefault(name, {})
@@ -127,6 +164,9 @@ def main():
                     if process.poll() is not None:
                         raise RuntimeError(f'{name} exited ({process.returncode}); see {run_dir}')
     try:
+        if args.recompute_localization:
+            launch('localization', ['ros2', 'launch', 'gn10_pointcloud_localization',
+                                    'localization.launch.py', 'use_sim_time:=true'])
         launch('opening', ['ros2', 'launch', 'lidar_perception_system', 'bucket_opening.launch.py',
                            'use_sim_time:=true', 'config_file:=' + str(args.config.resolve())])
         if args.baseline_executable:
@@ -137,15 +177,20 @@ def main():
                                       '-p', 'config_file:=' + str(args.baseline_config.resolve())])
         spin(4.)
         player = launch('bag', ['ros2', 'bag', 'play', str(args.bag.resolve()), '--clock',
-                                '--start-offset', str(args.offset), '--disable-keyboard-controls',
-                                '--topics', config['input_topic'], '/tf', '/tf_static'])
+                                '--start-offset', str(args.offset - args.warmup_seconds),
+                                '--disable-keyboard-controls', '--topics', *replay_topics])
         start = time.monotonic()
-        while time.monotonic() - start < args.seconds and player.poll() is None:
+        while (time.monotonic() - start < args.seconds + args.warmup_seconds
+               and player.poll() is None):
             rclpy.spin_once(node, timeout_sec=.01)
             for name, process in children:
                 if name != 'bag' and process.poll() is not None:
                     raise RuntimeError(f'{name} exited ({process.returncode}); see {run_dir}')
         report = {'offset_s': args.offset, 'elapsed_wall_s': time.monotonic() - start,
+                  'evaluation_duration_s': args.seconds, 'warmup_s': args.warmup_seconds,
+                  'tf_source': 'recomputed' if args.recompute_localization else 'recorded',
+                  'input_topic': config['input_topic'],
+                  'diagnostics_scope': 'Lifetime snapshots, including warmup; not frame totals.',
                   'clouds_received': cloud_count[0], 'streams': {}, 'diagnostics': diagnostic,
                   'status_samples': {k: dict(v) for k, v in reasons.items()},
                   'sampled_diagnostic_peaks': sampled_peaks,

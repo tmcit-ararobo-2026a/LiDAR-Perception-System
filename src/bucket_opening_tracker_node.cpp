@@ -250,7 +250,9 @@ class BucketOpeningTracker : public rclcpp::Node {
     last_result_.valid = false;
   }
   op::Points decode(const Cloud& c, const geometry_msgs::msg::TransformStamped& transform) const {
-    if (c.width == 0 || c.height == 0 || c.is_bigendian || c.point_step < 12 ||
+    // A structured zero-width cloud is a valid observation with no returns.
+    // Process it as a miss so the learned opening expires without a decode error.
+    if (c.height == 0 || c.is_bigendian || c.point_step < 12 ||
         c.data.size() > static_cast<size_t>(max_bytes_) ||
         static_cast<uint64_t>(c.width) * c.point_step > c.row_step ||
         static_cast<uint64_t>(c.row_step) * c.height > c.data.size()) {
@@ -543,6 +545,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("rim_radius_hypotheses", last_result_.fit.radius_hypotheses);
     add("rim_geometry_hypotheses", last_result_.fit.geometry_hypotheses);
     add("rim_edge_hypotheses", last_result_.fit.edge_hypotheses);
+    add("rim_interior_rejections", last_result_.fit.interior_rejections);
     if (!timings_.empty()) {
       std::vector<double> sorted(timings_.begin(), timings_.end());
       std::sort(sorted.begin(), sorted.end());

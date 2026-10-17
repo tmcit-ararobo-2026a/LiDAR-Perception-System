@@ -162,6 +162,7 @@ void Tracker::reset() {
   accumulated_.clear();
   reference_body_.clear();
   have_body_ = false;
+  identified_ = false;
   confirmed_ = false;
   height_pending_ = false;
   hits_ = 0;
@@ -438,9 +439,12 @@ std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& c
       if (radii[radii.size() * 9 / 10] - radii[radii.size() / 10] < cfg_.min_lip_width) {
         continue;
       }
-      int below = 0, above = 0;
+      int below = 0, above = 0, interior = 0;
       for (const auto& p : points) {
         const double radial = (p.head<2>() - center).norm();
+        if (radial < radius * 0.65 && std::abs(p.z() - top) <= cfg_.slice_m / 2) {
+          ++interior;
+        }
         if (p.z() < top - 0.03 && p.z() > top - 0.22 && std::abs(radial - radius) < 0.06) {
           ++below;
         }
@@ -453,18 +457,40 @@ std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& c
       if (below < cfg_.min_side_points || above >= 3) {
         continue;
       }
+      // A circle fitted through a solid deck is not an opening. Distinct
+      // coplanar returns in its central disk contradict a hollow mouth.
+      if (interior >= 3) {
+        if (stats) ++stats->interior_rejections;
+        continue;
+      }
       if (stats) ++stats->edge_hypotheses;
       int fresh = 0;
       std::vector<double> fresh_angles;
+      std::array<double, 128> fresh_min_radius, fresh_max_radius;
+      fresh_min_radius.fill(std::numeric_limits<double>::infinity());
+      fresh_max_radius.fill(-std::numeric_limits<double>::infinity());
       for (const auto& p : current) {
         const auto d = p.head<2>() - center;
         if (std::abs(p.z() - top) <= cfg_.slice_m / 2 &&
             std::abs(d.norm() - radius) <= cfg_.max_residual) {
           ++fresh;
-          fresh_angles.push_back(std::atan2(d.y(), d.x()));
+          const double a = std::atan2(d.y(), d.x());
+          fresh_angles.push_back(a);
+          const int bin = std::clamp(static_cast<int>((a + pi) / (2 * pi) * 128), 0, 127);
+          fresh_min_radius[bin] = std::min(fresh_min_radius[bin], d.norm());
+          fresh_max_radius[bin] = std::max(fresh_max_radius[bin], d.norm());
         }
       }
       if (fresh < cfg_.min_current_points || arc_span(fresh_angles) < 0.35) {
+        continue;
+      }
+      int fresh_lip_bins = 0;
+      for (size_t bin = 0; bin < fresh_min_radius.size(); ++bin) {
+        fresh_lip_bins += fresh_max_radius[bin] - fresh_min_radius[bin] >= cfg_.min_lip_width;
+      }
+      // Registration drift can broaden an accumulated wall contour. Require
+      // radial lip width in two narrow angular bins of the current scan too.
+      if (fresh_lip_bins < 2) {
         continue;
       }
       Opening candidate;
@@ -548,9 +574,11 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   }
   input_stamp_ = stamp;
   const bool unconfirmed_timeout =
-      have_body_ && !confirmed_ && stamp - acquired_stamp_ > cfg_.reset_s;
-  if (have_body_ && (stamp - body_stamp_ > cfg_.reset_s || unconfirmed_timeout ||
-                     (confirmed_ && stamp - observation_stamp_ > cfg_.reset_s))) {
+      have_body_ && !identified_ && stamp - acquired_stamp_ > cfg_.reset_s;
+  // Retain an identified robot while its body is still observed, even if the
+  // opening is occluded. Its expired opening remains invalid; body registration
+  // never renews the opening observation stamp or its prediction allowance.
+  if (have_body_ && (stamp - body_stamp_ > cfg_.reset_s || unconfirmed_timeout)) {
     const auto rejected = cluster_center_;
     const bool reject = unconfirmed_timeout && !height_pending_;
     reset();
@@ -786,6 +814,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   hits_ = std::min(cfg_.confirm_hits, hits_ + 1);
   confirmed_ = hits_ >= cfg_.confirm_hits;
   if (confirmed_) {
+    identified_ = true;
     height_pending_ = false;
   }
   variance_ =

@@ -48,6 +48,7 @@ struct Opening {
 struct FitStats {
   int max_slice_points{0}, radius_hypotheses{0}, geometry_hypotheses{0}, edge_hypotheses{0};
   int max_inliers{0};
+  int interior_rejections{0};
   double max_arc{0};
 };
 
@@ -102,7 +103,7 @@ class Tracker {
   double yaw_rate_{0}, body_stamp_{0}, input_stamp_{-1};
   double acquired_stamp_{0}, rejection_until_{0};
   std::optional<Eigen::Vector2d> rejected_center_;
-  bool have_body_{false}, confirmed_{false}, height_pending_{false};
+  bool have_body_{false}, identified_{false}, confirmed_{false}, height_pending_{false};
   int hits_{0};
   unsigned int next_id_{0}, track_id_{0}, height_resets_{0};
   std::optional<Opening> last_opening_;
