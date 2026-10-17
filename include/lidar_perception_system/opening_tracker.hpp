@@ -15,8 +15,8 @@ using Points = std::vector<Point>;
 struct Pose {
   Eigen::Vector2d xy{0, 0};
   double yaw{0};
-  Point world(const Point & p) const;
-  Point local(const Point & p) const;
+  Point world(const Point& p) const;
+  Point local(const Point& p) const;
 };
 
 struct Config {
@@ -59,22 +59,31 @@ struct Result {
 
 // Core has no ROS/GPU dependencies. All times are measurement times in seconds.
 class Tracker {
-public:
+ public:
   explicit Tracker(Config config);
-  Result process(const Points & map_points, double stamp, const Eigen::Vector2d & sensor_xy);
+  Result process(const Points& map_points, double stamp, const Eigen::Vector2d& sensor_xy);
   void reset();
-  void set_exclusions(const std::vector<Eigen::Vector3d> & masks);
-  const Points & selected_cloud() const {return selected_;}
-  const Points & accumulated_cloud() const {return accumulated_;}
-  unsigned int height_resets() const {return height_resets_;}
-  std::optional<Opening> fit_opening(const Points & accumulated, const Points & current) const;
-private:
-  struct Cluster {Points body; Eigen::Vector2d center; double min_x, max_x, min_y, max_y;};
-  struct Frame {double stamp; Points body, upper;};
-  std::vector<Cluster> clusters(const Points & points) const;
-  bool register_body(const Points & body, const Pose & initial, Pose & output,
-    double & rmse, double & overlap) const;
-  Result missing(double stamp, const std::string & reason, Result result = Result{});
+  void set_exclusions(const std::vector<Eigen::Vector3d>& masks);
+  const Points& selected_cloud() const { return selected_; }
+  const Points& accumulated_cloud() const { return accumulated_; }
+  const Points& body_model() const { return reference_body_; }
+  unsigned int height_resets() const { return height_resets_; }
+  std::optional<Opening> fit_opening(const Points& accumulated, const Points& current) const;
+
+ private:
+  struct Cluster {
+    Points body;
+    Eigen::Vector2d center;
+    double min_x, max_x, min_y, max_y;
+  };
+  struct Frame {
+    double stamp;
+    Points body, upper;
+  };
+  std::vector<Cluster> clusters(const Points& points) const;
+  bool register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
+                     double& overlap) const;
+  Result missing(double stamp, const std::string& reason, Result result = Result{});
   void rebuild(double stamp);
   Config cfg_;
   std::vector<Eigen::Vector3d> exclusions_;

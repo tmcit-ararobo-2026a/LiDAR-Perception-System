@@ -40,6 +40,13 @@ ament_target_dependencies(track_freshness_guard_node rclcpp sensor_msgs geometry
 target_link_libraries(track_freshness_guard_node
   nlohmann_json::nlohmann_json "${cpp_typesupport_target}")
 install(TARGETS track_freshness_guard_node DESTINATION lib/${PROJECT_NAME})
+
+add_executable(bucket_opening_tracker src/bucket_opening_tracker_node.cpp)
+ament_target_dependencies(bucket_opening_tracker
+  rclcpp sensor_msgs geometry_msgs diagnostic_msgs visualization_msgs tf2 tf2_ros tf2_msgs)
+target_link_libraries(bucket_opening_tracker opening_tracking_core
+  nlohmann_json::nlohmann_json "${cpp_typesupport_target}")
+install(TARGETS bucket_opening_tracker DESTINATION lib/${PROJECT_NAME})
 if(BUILD_GPU_NODES)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
@@ -76,6 +83,14 @@ if(BUILD_TESTING)
     ament_add_pytest_test(track_freshness_guard_test test/track_freshness_guard_test.py
       ENV TRACK_GUARD_EXECUTABLE=$<TARGET_FILE:track_freshness_guard_node>
       TIMEOUT 30)
+  endif()
+  if(BUILD_RUNTIME_NODES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/opening_tracker_ros_test.py")
+    find_package(ament_cmake_pytest REQUIRED)
+    ament_add_pytest_test(opening_tracker_ros_test test/opening_tracker_ros_test.py
+      ENV OPENING_TRACKER_EXECUTABLE=$<TARGET_FILE:bucket_opening_tracker>
+          TRACK_GUARD_EXECUTABLE=$<TARGET_FILE:track_freshness_guard_node>
+          OPENING_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/bucket_opening.json
+      TIMEOUT 45)
   endif()
 endif()
 

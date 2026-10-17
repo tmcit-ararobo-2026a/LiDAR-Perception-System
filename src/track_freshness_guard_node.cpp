@@ -38,6 +38,7 @@ public:
     observation_timeout_s_ = declare_parameter<double>("observation_timeout_s", prediction_s);
     frame_ = declare_parameter<std::string>("target_frame", config.value("target_frame", "map"));
     publish_tf_ = declare_parameter<bool>("publish_tf", config.value("publish_tf", false));
+    child_frame_ = declare_parameter<std::string>("child_frame", "moving_bucket");
     for (double limit : {input_timeout_s_, track_timeout_s_, observation_timeout_s_}) {
       if (!std::isfinite(limit) || limit <= 0) {
         throw std::invalid_argument("Freshness deadlines must be finite and positive");
@@ -47,7 +48,7 @@ public:
       config.value("input_topic", "/livox/lidar"));
     const auto raw_topic = declare_parameter<std::string>("raw_track_topic", "/moving_bucket_detector/target_raw");
     const auto output_topic = declare_parameter<std::string>("output_topic", "/moving_bucket_detector/target");
-    if (raw_topic == output_topic || frame_.empty()) {
+    if (raw_topic == output_topic || frame_.empty() || child_frame_.empty() || child_frame_ == frame_) {
       throw std::invalid_argument("Guard input/output must differ and frame must be nonempty");
     }
     publisher_ = create_publisher<Track>(output_topic, rclcpp::QoS(1).durability_volatile());
@@ -169,7 +170,7 @@ private:
     if (publish_tf_ && track_.observation_mode == Track::DIRECT && track_stamp_ns_ > last_tf_stamp_ns_) {
       geometry_msgs::msg::TransformStamped transform;
       transform.header = track_.header;
-      transform.child_frame_id = "moving_bucket";
+      transform.child_frame_id = child_frame_;
       transform.transform.translation.x = track_.position.x;
       transform.transform.translation.y = track_.position.y;
       transform.transform.translation.z = track_.position.z;
@@ -178,7 +179,7 @@ private:
       last_tf_stamp_ns_ = track_stamp_ns_;
     }
   }
-  std::string frame_;
+  std::string frame_, child_frame_;
   double input_timeout_s_{}, track_timeout_s_{}, observation_timeout_s_{};
   bool publish_tf_{}, have_cloud_{}, have_track_{};
   int64_t cloud_stamp_ns_{}, track_stamp_ns_{}, last_ros_now_ns_{}, last_tf_stamp_ns_{};
