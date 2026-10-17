@@ -1,0 +1,93 @@
+// Copyright 2026 tmcit-ararobo-2026a
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+
+#include <Eigen/Core>
+#include <deque>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace lidar_perception_system::opening {
+using Point = Eigen::Vector3d;
+using Points = std::vector<Point>;
+
+struct Pose {
+  Eigen::Vector2d xy{0, 0};
+  double yaw{0};
+  Point world(const Point & p) const;
+  Point local(const Point & p) const;
+};
+
+struct Config {
+  double min_x{-5}, max_x{5}, min_y{-5}, max_y{5};
+  double min_z{0.10}, max_z{2.20}, self_radius{0.8};
+  double body_min_z{0.15}, body_max_z{1.0}, cluster_resolution{0.10};
+  double min_span{0.20}, max_span{1.40}, crop_margin{0.30};
+  int min_body_points{20};
+  double body_voxel{0.03}, opening_voxel{0.01}, window_s{1.0};
+  int max_body_points{2000}, max_model_points{20000}, max_frame_points{50000};
+  double correspondence_m{0.15}, max_registration_rmse{0.05}, min_overlap{0.5};
+  int icp_iterations{20};
+  double min_opening_z{1.2}, max_opening_z{2.1};
+  double min_radius{0.110}, max_radius{0.150}, nominal_radius{0.1365};
+  double slice_m{0.020}, max_residual{0.015}, max_plane_rmse{0.004};
+  double min_arc{2.09439510239}, height_change_m{0.03}, min_lip_width{0.003};
+  int min_rim_points{12}, min_current_points{4}, min_side_points{8};
+  int ransac_iterations{80}, confirm_hits{3};
+  double prediction_s{0.3}, reset_s{2.0}, association_m{0.65};
+  void validate() const;
+};
+
+struct Opening {
+  Point center{0, 0, 0};
+  double radius{0}, residual{0}, plane_rmse{0}, arc{0}, score{0};
+  int points{0}, current_points{0};
+};
+
+struct Result {
+  bool valid{false}, predicted{false}, body_valid{false};
+  unsigned int track_id{0};
+  double stamp{0}, observation_stamp{0}, confidence{0}, position_variance{1};
+  Point position{0, 0, 0}, velocity{0, 0, 0};
+  Pose pose;
+  std::optional<Opening> opening;
+  std::string reason{"no target"};
+  int candidates{0}, model_points{0};
+  double registration_rmse{0}, overlap{0};
+};
+
+// Core has no ROS/GPU dependencies. All times are measurement times in seconds.
+class Tracker {
+public:
+  explicit Tracker(Config config);
+  Result process(const Points & map_points, double stamp, const Eigen::Vector2d & sensor_xy);
+  void reset();
+  void set_exclusions(const std::vector<Eigen::Vector3d> & masks);
+  const Points & selected_cloud() const {return selected_;}
+  const Points & accumulated_cloud() const {return accumulated_;}
+  unsigned int height_resets() const {return height_resets_;}
+  std::optional<Opening> fit_opening(const Points & accumulated, const Points & current) const;
+private:
+  struct Cluster {Points body; Eigen::Vector2d center; double min_x, max_x, min_y, max_y;};
+  struct Frame {double stamp; Points body, upper;};
+  std::vector<Cluster> clusters(const Points & points) const;
+  bool register_body(const Points & body, const Pose & initial, Pose & output,
+    double & rmse, double & overlap) const;
+  Result missing(double stamp, const std::string & reason, Result result = Result{});
+  void rebuild(double stamp);
+  Config cfg_;
+  std::vector<Eigen::Vector3d> exclusions_;
+  std::deque<Frame> frames_;
+  Points selected_, accumulated_, reference_body_;
+  Pose pose_;
+  Eigen::Vector2d body_velocity_{0, 0}, cluster_center_{0, 0};
+  double yaw_rate_{0}, body_stamp_{0}, input_stamp_{-1};
+  bool have_body_{false}, confirmed_{false}, height_pending_{false};
+  int hits_{0};
+  unsigned int next_id_{0}, track_id_{0}, height_resets_{0};
+  std::optional<Opening> last_opening_;
+  Point position_{0, 0, 0}, measured_{0, 0, 0}, velocity_{0, 0, 0};
+  double observation_stamp_{0}, variance_{1};
+};
+}  // namespace lidar_perception_system::opening
