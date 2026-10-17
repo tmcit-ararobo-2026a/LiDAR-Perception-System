@@ -22,4 +22,14 @@ def generate_launch_description():
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
             }],
         ),
+        Node(
+            package='lidar_perception_system',
+            executable='track_freshness_guard_node',
+            name='track_freshness_guard',
+            output='screen',
+            parameters=[{
+                'config_file': LaunchConfiguration('config_file'),
+                'use_sim_time': LaunchConfiguration('use_sim_time'),
+            }],
+        ),
     ])

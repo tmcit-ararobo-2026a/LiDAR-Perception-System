@@ -226,7 +226,6 @@ public:
     reset_s_ = config.at("tracking").at("reset_s").get<double>();
     tf_wait_s_ = config.at("tf_wait_s").get<double>();
     queue_size_ = config.at("queue_size").get<size_t>();
-    publish_tf_ = config.at("publish_tf").get<bool>();
     const auto max_bytes = config.at("max_input_bytes").get<size_t>();
     if (radius_ <= 0.0 || support_target_z_ <= 0.0 || gate_ <= 0.0 ||
       queue_size_ == 0 || queue_size_ > 32 ||
@@ -237,8 +236,7 @@ public:
     max_bytes_ = max_bytes;
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
-    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(this);
-    target_pub_ = create_publisher<TrackMsg>("~/target", 10);
+    target_pub_ = create_publisher<TrackMsg>("~/target_raw", 10);
     diagnostic_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("~/diagnostics", 10);
     marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("~/markers", 10);
     static_tf_sub_ = create_subscription<tf2_msgs::msg::TFMessage>("/tf_static",
@@ -528,16 +526,7 @@ private:
     if (marker_pub_->get_subscription_count() > 0) {
       publish_markers(output);
     }
-    if (valid && mode == TrackMsg::DIRECT && publish_tf_) {
-      geometry_msgs::msg::TransformStamped transform;
-      transform.header = output.header;
-      transform.child_frame_id = "moving_bucket";
-      transform.transform.translation.x = output.position.x;
-      transform.transform.translation.y = output.position.y;
-      transform.transform.translation.z = output.position.z;
-      transform.transform.rotation.w = 1.0;
-      tf_broadcaster_->sendTransform(transform);
-    }
+    // Final target TF is owned by the independent freshness guard.
   }
 
   void publish_markers(const TrackMsg & track)
@@ -697,7 +686,6 @@ private:
   std::unique_ptr<lps::CudaGrid> gpu_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
-  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::Subscription<CloudMsg>::SharedPtr sub_;
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr static_tf_sub_;
   std::vector<std::pair<std::string, Eigen::Vector3d>> static_exclusions_;
@@ -720,7 +708,7 @@ private:
   unsigned int min_points_{18}, last_points_{0}, track_id_{0};
   int min_cells_{5}, confirm_hits_{3}, hits_{0};
   size_t queue_size_{5}, max_bytes_{8 * 1024 * 1024};
-  bool publish_tf_{false}, has_track_{false};
+  bool has_track_{false};
   builtin_interfaces::msg::Time last_observation_stamp_;
   Eigen::Vector4d state_{Eigen::Vector4d::Zero()};
   Eigen::Matrix4d covariance_{Eigen::Matrix4d::Identity()};

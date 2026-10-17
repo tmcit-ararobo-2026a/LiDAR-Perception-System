@@ -10,3 +10,11 @@ log/
 
 # OS generated files
 .DS_Store
+
+# Python test artifacts
+__pycache__/
+.pytest_cache/
+
+# Local documentation and tests
+docs/
+test/
