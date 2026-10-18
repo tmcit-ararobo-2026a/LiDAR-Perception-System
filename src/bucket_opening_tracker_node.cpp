@@ -45,6 +45,11 @@ op::Config read_config(const nlohmann::json& j) {
   c.max_x = roi.at("max_x").get<double>();
   c.min_y = roi.at("min_y").get<double>();
   c.max_y = roi.at("max_y").get<double>();
+  const auto field = j.value("field_bounds", nlohmann::json::object());
+  c.field_min_x = field.value("min_x", c.field_min_x);
+  c.field_max_x = field.value("max_x", c.field_max_x);
+  c.field_min_y = field.value("min_y", c.field_min_y);
+  c.field_max_y = field.value("max_y", c.field_max_y);
   const auto filter = j.value("filter", nlohmann::json::object());
   const auto robot = j.value("robot", nlohmann::json::object());
   const auto accumulation = j.value("accumulation", nlohmann::json::object());
@@ -61,6 +66,8 @@ op::Config read_config(const nlohmann::json& j) {
   READ(robot, cluster_resolution);
   READ(robot, min_span);
   READ(robot, max_span);
+  READ(robot, max_body_side);
+  READ(robot, body_size_tolerance);
   READ(robot, crop_margin);
   READ(robot, min_body_points);
   READ(accumulation, body_voxel);

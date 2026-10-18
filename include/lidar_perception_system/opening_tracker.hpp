@@ -34,9 +34,12 @@ struct BottomConfig {
 
 struct Config {
   double min_x{-5}, max_x{5}, min_y{-5}, max_y{5};
+  // Fence inner faces in the supplied localization map (metres).
+  double field_min_x{-5.25}, field_max_x{5.25}, field_min_y{-5.70}, field_max_y{5.70};
   double min_z{0.10}, max_z{2.20}, self_radius{0.8};
   double body_min_z{0.15}, body_max_z{1.0}, cluster_resolution{0.10};
-  double min_span{0.20}, max_span{1.40}, crop_margin{0.30};
+  double min_span{0.20}, max_span{1.85}, crop_margin{0.30};
+  double max_body_side{1.20}, body_size_tolerance{0.05};
   int min_body_points{20};
   double body_voxel{0.03}, opening_voxel{0.01}, window_s{1.0};
   int max_body_points{2000}, max_model_points{20000}, max_frame_points{50000};
@@ -51,6 +54,7 @@ struct Config {
   int ransac_iterations{80}, confirm_hits{3};
   double prediction_s{0.3}, reset_s{2.0}, association_m{0.65};
   BottomConfig bottom;
+  bool inside_field(const Point& p) const;
   void validate() const;
 };
 
@@ -125,6 +129,7 @@ class Tracker {
     Points body, upper;
   };
   std::vector<Cluster> clusters(const Points& points) const;
+  bool body_size_valid(const Points& points) const;
   bool register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
                      double& overlap, Points* supported = nullptr) const;
   Result missing(double stamp, const std::string& reason, Result result = Result{});

@@ -96,11 +96,19 @@ Point Pose::local(const Point& p) const {
   const double c = std::cos(yaw), s = std::sin(yaw), x = p.x() - xy.x(), y = p.y() - xy.y();
   return {c * x + s * y, -s * x + c * y, p.z()};
 }
+bool Config::inside_field(const Point& p) const {
+  return p.allFinite() && p.x() >= field_min_x && p.x() <= field_max_x && p.y() >= field_min_y &&
+         p.y() <= field_max_y;
+}
 void Config::validate() const {
   for (double v : {min_x,
                    max_x,
                    min_y,
                    max_y,
+                   field_min_x,
+                   field_max_x,
+                   field_min_y,
+                   field_max_y,
                    min_z,
                    max_z,
                    self_radius,
@@ -109,6 +117,8 @@ void Config::validate() const {
                    cluster_resolution,
                    min_span,
                    max_span,
+                   max_body_side,
+                   body_size_tolerance,
                    crop_margin,
                    body_voxel,
                    opening_voxel,
@@ -154,8 +164,12 @@ void Config::validate() const {
       bottom.max_body_inference_s > 10) {
     throw std::invalid_argument("Invalid bottom geometry bounds");
   }
-  if (min_x >= max_x || min_y >= max_y || min_z >= max_z || min_support_spread_ratio < 0 ||
-      min_support_spread_ratio > 1 ||
+  if (field_min_x >= field_max_x || field_min_y >= field_max_y ||
+      std::max({std::abs(field_min_x), std::abs(field_max_x), std::abs(field_min_y),
+                std::abs(field_max_y)}) > 100 ||
+      max_body_side <= 0 || max_body_side > 3 || body_size_tolerance < 0 ||
+      body_size_tolerance > .2 || min_x >= max_x || min_y >= max_y || min_z >= max_z ||
+      min_support_spread_ratio < 0 || min_support_spread_ratio > 1 ||
       std::max({std::abs(min_x), std::abs(max_x), std::abs(min_y), std::abs(max_y), std::abs(min_z),
                 std::abs(max_z)}) > 100 ||
       body_min_z < min_z || body_min_z >= body_max_z || body_max_z >= min_opening_z ||
@@ -214,6 +228,27 @@ void Tracker::set_exclusions(const std::vector<Eigen::Vector3d>& masks) {
   acquisition_.set_exclusions(masks);
 }
 
+bool Tracker::body_size_valid(const Points& points) const {
+  if (points.empty()) return false;
+  // Search square orientations, not map-axis widths. A legal 1.2 m square
+  // spans 1.70 m in map X/Y at 45 degrees. One-degree sampling contributes
+  // at most 11 mm at the default size, covered by the measurement tolerance.
+  const double limit = cfg_.max_body_side + cfg_.body_size_tolerance;
+  for (int degrees = 0; degrees < 90; ++degrees) {
+    const double a = degrees * pi / 180, c = std::cos(a), s = std::sin(a);
+    Eigen::Vector2d lo = Eigen::Vector2d::Constant(std::numeric_limits<double>::infinity());
+    Eigen::Vector2d hi = -lo;
+    for (const auto& p : points) {
+      const Eigen::Vector2d q(c * p.x() + s * p.y(), -s * p.x() + c * p.y());
+      lo = lo.cwiseMin(q);
+      hi = hi.cwiseMax(q);
+      if ((hi - lo).maxCoeff() > limit) break;
+    }
+    if ((hi - lo).maxCoeff() <= limit) return true;
+  }
+  return false;
+}
+
 std::vector<Tracker::Cluster> Tracker::clusters(const Points& points) const {
   std::unordered_map<Key, Points, Hash> cells;
   for (const auto& p : points) {
@@ -264,6 +299,7 @@ std::vector<Tracker::Cluster> Tracker::clusters(const Points& points) const {
         c.max_x - c.min_x > cfg_.max_span || c.max_y - c.min_y > cfg_.max_span) {
       continue;
     }
+    if (!body_size_valid(c.body)) continue;
     c.center /= c.body.size();
     c.body = voxelize(c.body, cfg_.body_voxel, cfg_.max_body_points);
     result.push_back(std::move(c));
@@ -607,8 +643,14 @@ void Tracker::rebuild(double stamp) {
     // contain only unique, close registration support after acquisition.
     if (identified_ || motion_seeded_)
       body.insert(body.end(), reference_body_.begin(), reference_body_.end());
+    body.erase(std::remove_if(body.begin(), body.end(),
+                              [&](const Point& p) { return !cfg_.inside_field(pose_.world(p)); }),
+               body.end());
     reference_body_ = voxelize(body, cfg_.body_voxel, cfg_.max_body_points);
   }
+  upper.erase(std::remove_if(upper.begin(), upper.end(),
+                             [&](const Point& p) { return !cfg_.inside_field(pose_.world(p)); }),
+              upper.end());
   accumulated_ = voxelize(upper, cfg_.opening_voxel, cfg_.max_model_points);
 }
 Result Tracker::missing(double stamp, const std::string& reason, Result result) {
@@ -638,6 +680,10 @@ Result Tracker::missing(double stamp, const std::string& reason, Result result) 
     result.position.z() = position_.z();
     result.opening = last_opening_;
     result.position_variance = variance_ + 0.1 * (stamp - observation_stamp_);
+    if (!cfg_.inside_field(result.position)) {
+      result.valid = result.predicted = false;
+      result.opening.reset();
+    }
   }
   return result;
 }
@@ -674,18 +720,18 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   rebuild(stamp);
   Points filtered;
   filtered.reserve(std::min(map_points.size(), static_cast<size_t>(cfg_.max_frame_points)));
-  // Uniform input decimation bounds work without retaining the first spatial
-  // sector only.
+  const auto accepted = [&](const Point& p) {
+    return cfg_.inside_field(p) && p.x() >= cfg_.min_x && p.x() <= cfg_.max_x &&
+           p.y() >= cfg_.min_y && p.y() <= cfg_.max_y && p.z() >= cfg_.min_z &&
+           p.z() <= cfg_.max_z && (p.head<2>() - sensor_xy).norm() >= cfg_.self_radius;
+  };
+  // Outside returns must not consume the decimation budget of field points.
+  const size_t count = std::count_if(map_points.begin(), map_points.end(), accepted);
   const size_t stride =
-      std::max(size_t{1}, (map_points.size() + cfg_.max_frame_points - 1) / cfg_.max_frame_points);
-  for (size_t i = 0; i < map_points.size(); i += stride) {
-    const auto& p = map_points[i];
-    if (!p.allFinite() || p.x() < cfg_.min_x || p.x() > cfg_.max_x || p.y() < cfg_.min_y ||
-        p.y() > cfg_.max_y || p.z() < cfg_.min_z || p.z() > cfg_.max_z ||
-        (p.head<2>() - sensor_xy).norm() < cfg_.self_radius) {
-      continue;
-    }
-    filtered.push_back(p);
+      std::max(size_t{1}, (count + cfg_.max_frame_points - 1) / cfg_.max_frame_points);
+  size_t accepted_index = 0;
+  for (const auto& p : map_points) {
+    if (accepted(p) && accepted_index++ % stride == 0) filtered.push_back(p);
   }
   auto candidates = clusters(filtered);
   const double elapsed = have_body_ ? stamp - body_stamp_ : 0;
@@ -878,6 +924,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       return missing(stamp, "robot registration rejected", result);
     }
     chosen->body = std::move(supported_body);
+    if (!body_size_valid(chosen->body))
+      return missing(stamp, "robot body exceeds size envelope", result);
     if (elapsed > 0) {
       const auto v = (updated.xy - pose_.xy) / elapsed;
       body_velocity_ = 0.5 * body_velocity_ + 0.5 * v;
@@ -936,6 +984,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   }
   rebuild(stamp);
   auto bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
+  if (bottom && !cfg_.inside_field(pose_.world(bottom->center))) bottom.reset();
   if (bottom && last_bottom_ &&
       std::abs(bottom->center.z() - last_bottom_->center.z()) > cfg_.height_change_m) {
     // The bucket may lift relative to the chassis. Do not blend its old and new
@@ -944,6 +993,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     frames_.back().upper = upper;
     rebuild(stamp);
     bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
+    if (bottom && !cfg_.inside_field(pose_.world(bottom->center))) bottom.reset();
     bottom_hits_ = 0;
     last_bottom_.reset();
     confirmed_ = false;
@@ -988,7 +1038,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     // An unconfirmed contradictory candidate suppresses this frame, but must
     // not erase a recognized mount. Replace the anchor only after confirmation.
   }
-  if (learned_bottom_ && result.bottom_tracking_mode != BottomMode::None) {
+  if (learned_bottom_ && result.bottom_tracking_mode != BottomMode::None &&
+      cfg_.inside_field(pose_.world(learned_bottom_->center))) {
     result.tracked_bottom = learned_bottom_;
     result.bottom_tracking_observation_stamp = learned_bottom_stamp_;
     if (result.bottom_tracking_mode == BottomMode::BodyInferred) {
@@ -997,6 +1048,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
   }
   auto opening = fit_opening(accumulated_, upper, &result.fit);
+  if (opening && !cfg_.inside_field(pose_.world(opening->center))) opening.reset();
   if (opening && last_opening_ &&
       std::abs(opening->center.z() - last_opening_->center.z()) > cfg_.height_change_m) {
     for (auto& previous : frames_) {
@@ -1005,6 +1057,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     frames_.back().upper = upper;
     rebuild(stamp);
     opening = fit_opening(accumulated_, upper, &result.fit);
+    if (opening && !cfg_.inside_field(pose_.world(opening->center))) opening.reset();
     confirmed_ = false;
     hits_ = 0;
     height_pending_ = true;
@@ -1059,6 +1112,10 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   result.position_variance = variance_;
   result.confidence =
       std::clamp(opening->arc / (2 * pi) * (1 - opening->residual / cfg_.max_residual), 0.0, 1.0);
+  if (!cfg_.inside_field(result.position)) {
+    result.valid = false;
+    result.reason = "opening outside field";
+  }
   return result;
 }
 }  // namespace lidar_perception_system::opening
