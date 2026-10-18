@@ -314,10 +314,15 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
     }
     std::sort(pairs.begin(), pairs.end(),
               [](const auto& a, const auto& b) { return a.squared < b.squared; });
+    // Optimize with trimming, but rank/check the complete set of matched
+    // returns. On a regular chassis, discarding its edges can make a wrong
+    // translation by one grid period appear to have zero residual.
+    double all_squared = 0;
+    for (const auto& pair : pairs) all_squared += pair.squared;
+    rmse = std::sqrt(all_squared / pairs.size());
     pairs.resize(std::max(size_t{12}, pairs.size() * 7 / 10));
     Eigen::Matrix3d h = Eigen::Matrix3d::Zero();
     Point g = Point::Zero();
-    double sum = 0;
     for (const auto& pair : pairs) {
       const Eigen::Vector2d e = (pair.p - pair.q).head<2>();
       Eigen::Matrix<double, 2, 3> j;
@@ -325,9 +330,7 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
       const double w = std::min(1.0, 0.03 / std::max(1e-9, std::sqrt(pair.squared)));
       h.noalias() += w * j.transpose() * j;
       g.noalias() += w * j.transpose() * e;
-      sum += pair.squared;
     }
-    rmse = std::sqrt(sum / pairs.size());
     const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigen(h);
     if (eigen.info() != Eigen::Success || eigen.eigenvalues().minCoeff() < 1e-5 ||
         eigen.eigenvalues().minCoeff() / eigen.eigenvalues().maxCoeff() < 1e-4) {
@@ -771,7 +774,32 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     Pose initial = pose_;
     initial.xy += body_velocity_ * elapsed;
     initial.yaw = angle(initial.yaw + yaw_rate_ * elapsed);
-    if (!register_body(chosen->body, initial, updated, result.registration_rmse, result.overlap)) {
+    bool registered =
+        register_body(chosen->body, initial, updated, result.registration_rmse, result.overlap);
+    // Repeated chassis structure can trap nearest-neighbor ICP one grid period
+    // away. Also try centering the two voxelized bodies before registration.
+    // The centroid is only a bounded seed; never use it as the final pose.
+    Point reference_center = Point::Zero(), observed_center = Point::Zero();
+    for (const auto& p : reference_body_) reference_center += p;
+    for (const auto& p : chosen->body) observed_center += p;
+    reference_center /= reference_body_.size();
+    observed_center /= chosen->body.size();
+    const Eigen::Vector2d correction =
+        (observed_center - initial.world(reference_center)).head<2>();
+    if (correction.norm() > cfg_.body_voxel * .2 && correction.norm() < cfg_.correspondence_m) {
+      Pose alternate = initial, fitted;
+      alternate.xy += correction;
+      double rmse = 0, overlap = 0;
+      if (register_body(chosen->body, alternate, fitted, rmse, overlap) &&
+          (!registered ||
+           (rmse + .0001 < result.registration_rmse && overlap >= result.overlap - .05))) {
+        registered = true;
+        updated = fitted;
+        result.registration_rmse = rmse;
+        result.overlap = overlap;
+      }
+    }
+    if (!registered) {
       if (!confirmed_) {
         hits_ = 0;
       }
