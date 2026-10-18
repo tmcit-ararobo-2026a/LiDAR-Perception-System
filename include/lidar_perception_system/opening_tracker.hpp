@@ -27,6 +27,8 @@ struct BottomConfig {
   double min_radius{0.075}, max_radius{0.135};
   double plane_distance{0.012}, max_plane_rmse{0.008}, max_tilt_rad{0.1745329252};
   double connection_m{0.035}, side_tolerance{0.030}, min_side_span{0.12};
+  // Zero retains a learned semantic mount while the same body is observed.
+  double max_body_inference_s{0.0};
   int min_plane_points{20}, min_current_points{4}, min_side_points{6};
 };
 
@@ -66,6 +68,9 @@ struct Bottom {
 // Geometry evidence only: no fixed mounting coordinates or opening inference.
 std::optional<Bottom> fit_bucket_bottom(const Points& accumulated, const Points& current,
                                         const Config& config);
+std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& current,
+                                          const Config& config);
+enum class BottomMode { None = 0, Direct = 1, PlaneTracked = 2, BodyInferred = 3 };
 
 struct FitStats {
   int max_slice_points{0}, radius_hypotheses{0}, geometry_hypotheses{0}, edge_hypotheses{0};
@@ -80,6 +85,9 @@ struct Result {
   bool bottom_valid{false};
   double bottom_observation_stamp{0};
   std::optional<Bottom> bottom;
+  BottomMode bottom_tracking_mode{BottomMode::None};
+  std::optional<Bottom> tracked_bottom;
+  double bottom_tracking_observation_stamp{0};
   unsigned int track_id{0};
   double stamp{0}, observation_stamp{0}, confidence{0}, position_variance{1};
   Point position{0, 0, 0}, velocity{0, 0, 0};
@@ -137,6 +145,8 @@ class Tracker {
   unsigned int next_id_{0}, track_id_{0}, height_resets_{0};
   std::optional<Opening> last_opening_;
   std::optional<Bottom> last_bottom_;
+  std::optional<Bottom> learned_bottom_;
+  double learned_bottom_stamp_{0};
   int bottom_hits_{0};
   double bottom_stamp_{0};
   Point position_{0, 0, 0}, measured_{0, 0, 0}, velocity_{0, 0, 0};

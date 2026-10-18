@@ -189,14 +189,15 @@ JSONの`bottom`で次を設定できます。
 | `min_plane_points` | 20 | 蓄積面の最低支持点数 |
 | `min_current_points` | 4 | 最新scanの最低面支持点数 |
 | `min_side_points` | 6 | 上側側面の最低支持点数 |
+| `max_body_inference_s` | 0 | 0は同じ車体を観測できる間、取付点モデルを保持。正値なら面欠測時の補完上限（最大10秒） |
 
 探索する底面高さは、開口の許容高さからバケツ高さを引いて導出します。取付位置の探索範囲は相手ROIと`robot.crop_margin`にも依存します。底面・側面が完全に隠れる、透明材から十分な反射が返らない、同形状の物体と区別できない場合は未確定です。ルールの共通バケツを対象とする方式であり、任意の形状・遮蔽・機体に対する成功保証ではありません。別の実ロボットでの検出率は未受入です。
 
 ### 旧マーカーから新しい底面表示へ切り替える
 
-`/moving_bucket_detector/markers`は従来方式の出力です。`moving_bucket.launch.py`や`moving_bucket_rviz.launch.py`で新しい底面検出は起動しません。底面の表示は`bucket_opening_rviz.launch.py`を起動し、`/bucket_opening_tracker/bottom_markers`（橙の円）と`/bucket_opening_tracker/bottom_cloud`を確認してください。RVizのFixed Frameは`map`です。`/bucket_opening_tracker/markers`は開口の結果です。
+`/moving_bucket_detector/markers`は従来方式の出力です。`moving_bucket.launch.py`や`moving_bucket_rviz.launch.py`で新しい底面検出は起動しません。底面の表示は`bucket_opening_rviz.launch.py`を起動し、`/bucket_opening_tracker/bottom_markers`（認識は橙、面追跡は黄、車体からの補完は水色）と`/bucket_opening_tracker/bottom_cloud`を確認してください。RVizのFixed Frameは`map`です。`/bucket_opening_tracker/markers`は開口の結果です。
 
-既存RVizを使う場合はMarkerArray表示を追加して`/bucket_opening_tracker/bottom_markers`を選びます。別途`bucket_opening.launch.py`で新ノードを起動する必要があります。検出が未確定または失効したときは底面markerを削除するため、常時表示されるものではありません。
+既存RVizを使う場合はMarkerArray表示を追加して`/bucket_opening_tracker/bottom_markers`を選びます。別途`bucket_opening.launch.py`で新ノードを起動する必要があります。最初の形状認識前、車体登録失敗、底面観測の期限超過、入力停止時には底面markerを削除します。
 
 比較画像の「横位置」は画像用に原点を移した相対座標で、mapのX/Y座標そのものではありません。画像上の横位置をそのままRVizの座標へ指定しないでください。設定ファイルは再起動後も残る場所へ保存してください。`input_topic`を`/dynamic_cloud`にする場合は、そのpublisherが自己位置推定から配信されていることも確認します。
 
@@ -204,9 +205,10 @@ JSONの`bottom`で次を設定できます。
 
 | 名前 | 内容 |
 | --- | --- |
-| `/bucket_opening_tracker/bottom` | `BucketBottom`：底面中心・法線・半径・面残差・蓄積／最新／側面の支持点数・valid・観測stamp。開口の照準点ではない |
-| `/bucket_opening_tracker/bottom_cloud` | 確定した底面の支持点（map座標）、未確定時は空 |
-| `/bucket_opening_tracker/bottom_markers` | 底面円・中心球（橙色）と中心からのXYZ軸（赤・緑・青）、未確定・失効時はすべて削除 |
+| `/bucket_opening_tracker/bottom` | `BucketBottom`：従来どおり、形状認識が確定した底面だけvalid（DIRECT）。開口の照準点ではない |
+| `/bucket_opening_tracker/bottom_track` | `BucketBottom`：認識済み底面の追跡結果。DIRECT／PLANE_TRACKED／BODY_INFERREDと元の面観測stampを区別 |
+| `/bucket_opening_tracker/bottom_cloud` | 現在scanの追跡面支持点（map座標）、車体からの補完・無効時は空 |
+| `/bucket_opening_tracker/bottom_markers` | 底面円・中心球（認識:橙、面追跡:黄、車体補完:水色）とXYZ軸（赤・緑・青）、無効時はすべて削除 |
 | `/bucket_opening_tracker/target_raw` | 監視前の`MovingBucketTrack` |
 | `/bucket_opening_tracker/target` | 独立CPU監視後の開口中心・水平速度・不確かさ・valid |
 | `/bucket_opening_tracker/selected_cloud` | 選択した相手領域の最新3次元点群（map座標） |
@@ -215,11 +217,15 @@ JSONの`bottom`で次を設定できます。
 | `/bucket_opening_tracker/robot_markers` | 相手局所座標の軸 |
 | `/bucket_opening_tracker/diagnostics` | 処理件数・候補数・ICPの残差／対応率・蓄積点数・開口仮説の各段階・処理時間 |
 | `map → lps_opponent_<id>` | 車体姿勢を観測できた時刻の局所座標TF |
-| `map → bucket_bottom` | 確定した底面中心の動的TF。底面を観測した時刻だけ配信 |
+| `map → bucket_bottom` | bottom_trackの底面中心の動的TF。新しい車体姿勢に同期して認識／追跡が有効なとき配信 |
 
 `DIRECT`は最新点にも裏付けられた開口推定、`PREDICTED`は新しい開口観測のない短期予測です。支持部からの固定高さ出力はしません。新方式の`support_points`は最新フレームで開口円を支持した点数です。開口の緑／青マーカーは監視後の結果から作り、無効時は削除します。点群と座標軸は検出過程の可視化で、有効な照準結果とは区別してください。
 
-底面TF `bucket_bottom`は底面の確定時に自動配信します。原点は底面中心、Z軸は底面の上向き法線、X軸は相手局所座標のX方向を底面へ投影した方向、Y軸は右手系です。円形の底面自体からyawを測定したものではありません。親は`target_frame`（既定`map`）、stampは`BucketBottom.header.stamp`と一致します。未確定・失効時は配信を止めます。TFの過去データは受信側のbufferに残るため、利用時は`/bucket_opening_tracker/bottom`の`valid`と観測時刻も確認してください。
+`BucketBottom`型に`observation_mode`を追加しています。この型を使う独自のC++ノードがある場合は再ビルドし、購読ノードも再起動してください。
+
+底面を一度形状認識した後は、相手の局所座標に取付位置を保存します。毎scanで円盤全体を再認識する必要はありません。現在の底面近傍に最低4点の二次元的な広がりを持つ平面があれば、高さ・法線を補正して`PLANE_TRACKED`として追跡します。局所XYと半径は最初に認識した値を引き継ぐため、部分面だけから新しいバケツを認識した意味ではありません。面が隠れた区間は現在の車体ICP姿勢から`BODY_INFERRED`として位置を更新します。既定では同じ車体を観測できる間、学習した取付点を車体モデルの一部として保持します。`bottom.max_body_inference_s`を正値にすると、その秒数を面の最終観測から超えた時点で停止し、全体形状の再認識が必要です。車体登録の失敗・別track・検出された昇降でも追跡出力を無効にします。完全遮蔽中の昇降や取付位置変更は観測できず、BODY_INFERREDの底面位置には追従できません。このモードは最後に認識した取付位置が車体に対して変わらないというモデル予測です。
+
+底面TF `bucket_bottom`は`/bucket_opening_tracker/bottom_track`の有効結果から自動配信します。原点は底面中心、Z軸は底面法線、X軸は相手局所Xを底面へ投影した方向、Y軸は右手系です。円形底面からyawを測定した意味ではありません。親は`target_frame`（既定`map`）、TFのstampは現在の追跡時刻です。`last_observation_stamp`は面を観測した時刻を保持し、車体だけの更新では延長しません。`BODY_INFERRED`のconfidenceとcurrent_pointsは0です。TFの過去履歴は受信bufferに残るため、利用側はbottom_trackのvalid・observation_mode・観測時刻も確認してください。入力やROS時計の停止時には、steady時計でも既定0.3秒で失効します。
 
 開口TFは既定で無効です。JSONの`publish_tf`を有効にすると、新方式のguardは`map → bucket_opening`を直接観測時だけ配信します。この設定は底面TFには影響しません。旧方式の`moving_bucket`とは別名です。guardの`child_frame`パラメータの既定値は従来どおり`moving_bucket`です。
 
@@ -234,6 +240,8 @@ ros2 run lidar_perception_system benchmark_opening.py /absolute/path/to/bag --co
 自己位置推定を再実行する場合は、`gn10_pointcloud_localization`をビルド・sourceした環境で`--recompute-localization`を付けます。スクリプトが`localization.launch.py use_sim_time:=true`を起動し、bagの`/livox/lidar /livox/imu`だけを再生します。記録済みTFは流しません。このモードではJSONの`input_topic`を`/dynamic_cloud`へ変更して、静的地図との差分点群から相手の局所モデルを作る比較もできます。ここでの差分は地図との幾何的な不一致であり、停止中の相手も含みます。自己位置推定の誤差や地図上の固定物との近接による点の除去には注意が必要です。
 
 試合前からモデルを蓄積するには`--warmup-seconds`を指定します。例えば`--offset 936 --warmup-seconds 36 --seconds 180 --recompute-localization`は900秒から再生し、936秒から180秒間の計測だけを件数に集計します。準備区間と試合区間で追跡状態をリセットしません。診断のカウンタ・ピークは準備区間も含む生存期間のスナップショットなので、試合中の件数とは区別してください。記録に存在しないセッティング区間の点群は復元できません。
+
+比較レポートの`bottom`は直接認識だけ、`bottom_tracking`はDIRECT／PLANE_TRACKED／BODY_INFERREDの件数を分けて記録します。件数や有効出力間の最大間隔は真値付き精度・連続認識率ではありません。
 
 終了時刻はbagのROS clockで判定し、開始処理の待ち時間によって集計区間が短くならないようにします。`evaluation_completed`は指定した区間の終端まで再生できたかを表します。記録の途中終了やclockの停止で区間を完了できなければスクリプトは異常終了します。
 

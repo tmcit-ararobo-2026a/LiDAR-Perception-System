@@ -110,6 +110,7 @@ def main():
     subscriptions = []
     cloud_count = [0]
     bottom_observations = {}
+    bottom_tracks = {}
     def bottom(message):
         if not in_evaluation(message.header.stamp):
             return
@@ -118,6 +119,12 @@ def main():
             bottom_observations[stamp] = message.track_id
     subscriptions.append(node.create_subscription(BucketBottom,
         '/bucket_opening_tracker/bottom', bottom, 100))
+    def bottom_track(message):
+        if in_evaluation(message.header.stamp) and message.valid:
+            stamp = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
+            bottom_tracks[stamp] = (message.observation_mode, message.track_id)
+    subscriptions.append(node.create_subscription(BucketBottom,
+        '/bucket_opening_tracker/bottom_track', bottom_track, 100))
     subscriptions.append(node.create_subscription(PointCloud2, config['input_topic'],
         lambda m: cloud_count.__setitem__(0, cloud_count[0] + int(in_evaluation(m.header.stamp))),
         rclpy.qos.qos_profile_sensor_data))
@@ -233,6 +240,16 @@ def main():
         report['bottom'] = {'valid_measurements': len(bottom_observations),
                             'track_ids': len(set(bottom_observations.values())),
                             'accuracy_evaluated': False}
+        track_stamps = sorted(bottom_tracks)
+        report['bottom_tracking'] = {
+            'valid_outputs': len(bottom_tracks),
+            'direct': sum(mode == BucketBottom.DIRECT for mode, _ in bottom_tracks.values()),
+            'plane_tracked': sum(mode == BucketBottom.PLANE_TRACKED for mode, _ in bottom_tracks.values()),
+            'body_inferred': sum(mode == BucketBottom.BODY_INFERRED for mode, _ in bottom_tracks.values()),
+            'track_ids': len({track for _, track in bottom_tracks.values()}),
+            'max_gap_between_valid_outputs_s': max(
+                ((b - a) / 1e9 for a, b in zip(track_stamps, track_stamps[1:])), default=None),
+            'accuracy_evaluated': False}
         args.output.write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(report, indent=2))
         if (cloud_count[0] == 0 or not streams['opening']['raw']

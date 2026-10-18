@@ -137,7 +137,7 @@ void Config::validate() const {
   for (double v :
        {bottom.bucket_height, bottom.height_tolerance, bottom.min_radius, bottom.max_radius,
         bottom.plane_distance, bottom.max_plane_rmse, bottom.max_tilt_rad, bottom.connection_m,
-        bottom.side_tolerance, bottom.min_side_span}) {
+        bottom.side_tolerance, bottom.min_side_span, bottom.max_body_inference_s}) {
     if (!std::isfinite(v)) throw std::invalid_argument("Bottom config must be finite");
   }
   if (bottom.bucket_height < .1 || bottom.bucket_height > .5 || bottom.height_tolerance < 0 ||
@@ -149,7 +149,8 @@ void Config::validate() const {
       bottom.side_tolerance <= 0 || bottom.side_tolerance > .05 || bottom.min_side_span < .05 ||
       bottom.min_side_span > bottom.bucket_height || bottom.min_plane_points < 6 ||
       bottom.min_plane_points > max_model_points || bottom.min_current_points < 3 ||
-      bottom.min_side_points < 3) {
+      bottom.min_side_points < 3 || bottom.max_body_inference_s < 0 ||
+      bottom.max_body_inference_s > 10) {
     throw std::invalid_argument("Invalid bottom geometry bounds");
   }
   if (min_x >= max_x || min_y >= max_y || min_z >= max_z ||
@@ -192,6 +193,8 @@ void Tracker::clear_model() {
   hits_ = 0;
   last_opening_.reset();
   last_bottom_.reset();
+  learned_bottom_.reset();
+  learned_bottom_stamp_ = 0;
   bottom_hits_ = 0;
   bottom_stamp_ = 0;
   body_stamp_ = 0;
@@ -840,6 +843,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     height_pending_ = true;
     acquired_stamp_ = stamp;
     last_opening_.reset();
+    learned_bottom_.reset();
     ++height_resets_;
   }
   Frame frame;
@@ -864,6 +868,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
     bottom_hits_ = 0;
     last_bottom_.reset();
+    learned_bottom_.reset();
     confirmed_ = false;
     hits_ = 0;
     last_opening_.reset();
@@ -879,11 +884,39 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     bottom_stamp_ = stamp;
     result.bottom = bottom;
     result.bottom_valid = bottom_hits_ >= cfg_.confirm_hits;
-    if (result.bottom_valid) identified_ = true;
+    if (result.bottom_valid) {
+      identified_ = true;
+      learned_bottom_ = bottom;
+      learned_bottom_stamp_ = stamp;
+      result.bottom_tracking_mode = BottomMode::Direct;
+    }
   } else {
     bottom_hits_ = 0;
   }
   result.bottom_observation_stamp = bottom_stamp_;
+  if (!result.bottom_valid && learned_bottom_) {
+    const double age = stamp - learned_bottom_stamp_;
+    // Never revive an expired semantic anchor from an arbitrary nearby plane.
+    if (age < 0 ||
+        (cfg_.bottom.max_body_inference_s > 0 && age > cfg_.bottom.max_body_inference_s) ||
+        (bottom && (bottom->center - learned_bottom_->center).norm() > .08)) {
+      learned_bottom_.reset();
+    } else if (auto plane = track_bucket_bottom(*learned_bottom_, upper, cfg_)) {
+      learned_bottom_ = plane;
+      learned_bottom_stamp_ = stamp;
+      result.bottom_tracking_mode = BottomMode::PlaneTracked;
+    } else {
+      result.bottom_tracking_mode = BottomMode::BodyInferred;
+    }
+  }
+  if (learned_bottom_ && result.bottom_tracking_mode != BottomMode::None) {
+    result.tracked_bottom = learned_bottom_;
+    result.bottom_tracking_observation_stamp = learned_bottom_stamp_;
+    if (result.bottom_tracking_mode == BottomMode::BodyInferred) {
+      result.tracked_bottom->current_points = 0;
+      result.tracked_bottom->side_points = 0;
+    }
+  }
   auto opening = fit_opening(accumulated_, upper, &result.fit);
   if (opening && last_opening_ &&
       std::abs(opening->center.z() - last_opening_->center.z()) > cfg_.height_change_m) {
@@ -898,6 +931,9 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     height_pending_ = true;
     acquired_stamp_ = stamp;
     last_opening_.reset();
+    learned_bottom_.reset();
+    result.tracked_bottom.reset();
+    result.bottom_tracking_mode = BottomMode::None;
     ++height_resets_;
   }
   if (!opening) {

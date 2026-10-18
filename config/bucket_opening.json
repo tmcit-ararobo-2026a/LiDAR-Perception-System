@@ -40,6 +40,7 @@
     "connection_m": 0.035,
     "side_tolerance": 0.03,
     "min_side_span": 0.12,
+    "max_body_inference_s": 0.0,
     "min_plane_points": 20,
     "min_current_points": 4,
     "min_side_points": 6

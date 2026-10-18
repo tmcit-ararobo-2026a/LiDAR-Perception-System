@@ -242,4 +242,44 @@ std::optional<Bottom> fit_bucket_bottom(const Points& accumulated, const Points&
   if (candidates.size() > 1 && candidates[1].score > candidates[0].score - .7) return {};
   return candidates.front();
 }
+std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& current,
+                                          const Config& cfg) {
+  if (!learned.center.allFinite() || !learned.normal.allFinite() || learned.normal.norm() < .99 ||
+      learned.radius < cfg.bottom.min_radius || learned.radius > cfg.bottom.max_radius ||
+      current.size() > static_cast<size_t>(cfg.max_model_points))
+    return {};
+  Points support;
+  for (const auto& p : current) {
+    if (p.allFinite() && (p.head<2>() - learned.center.head<2>()).norm() < learned.radius &&
+        std::abs(learned.normal.dot(p - learned.center)) <= cfg.height_change_m)
+      support.push_back(p);
+  }
+  if (support.size() < static_cast<size_t>(cfg.bottom.min_current_points)) return {};
+  Point mean = Point::Zero();
+  for (const auto& p : support) mean += p;
+  mean /= support.size();
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  for (const auto& p : support) covariance += (p - mean) * (p - mean).transpose();
+  covariance /= support.size();
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(covariance);
+  if (eig.info() != Eigen::Success || eig.eigenvalues()[1] < .0001) return {};
+  Point normal = eig.eigenvectors().col(0);
+  if (normal.z() < 0) normal = -normal;
+  const double rmse = std::sqrt(std::max(0., eig.eigenvalues()[0]));
+  if (normal.z() < std::cos(cfg.bottom.max_tilt_rad) ||
+      normal.dot(learned.normal) < std::cos(cfg.bottom.max_tilt_rad) ||
+      rmse > cfg.bottom.max_plane_rmse)
+    return {};
+  Bottom tracked = learned;
+  // Partial returns cannot identify a new disk center/radius. Correct only the
+  // measured plane height/normal, keeping the previously recognized local XY.
+  tracked.center.z() =
+      mean.z() - normal.head<2>().dot(learned.center.head<2>() - mean.head<2>()) / normal.z();
+  if (std::abs(tracked.center.z() - learned.center.z()) > cfg.height_change_m) return {};
+  tracked.normal = normal;
+  tracked.plane_rmse = rmse;
+  tracked.plane_points = tracked.current_points = static_cast<int>(support.size());
+  tracked.side_points = 0;
+  return tracked;
+}
 }  // namespace lidar_perception_system::opening

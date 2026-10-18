@@ -103,6 +103,7 @@ op::Config read_config(const nlohmann::json& j) {
   READ_BOTTOM(connection_m);
   READ_BOTTOM(side_tolerance);
   READ_BOTTOM(min_side_span);
+  READ_BOTTOM(max_body_inference_s);
   READ_BOTTOM(min_plane_points);
   READ_BOTTOM(min_current_points);
   READ_BOTTOM(min_side_points);
@@ -178,6 +179,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     selected_ = create_publisher<Cloud>("~/selected_cloud", rclcpp::SensorDataQoS());
     accumulated_ = create_publisher<Cloud>("~/accumulated_cloud", rclcpp::SensorDataQoS());
     bottom_ = create_publisher<BottomTrack>("~/bottom", 10);
+    bottom_track_ = create_publisher<BottomTrack>("~/bottom_track", 10);
     bottom_markers_ =
         create_publisher<visualization_msgs::msg::MarkerArray>("~/bottom_markers", 10);
     bottom_cloud_ = create_publisher<Cloud>("~/bottom_cloud", rclcpp::SensorDataQoS());
@@ -447,15 +449,57 @@ class BucketOpeningTracker : public rclcpp::Node {
     m.lifetime = rclcpp::Duration::from_seconds(0.35);
     return m;
   }
-  void publish_bottom(const op::Result& r, std_msgs::msg::Header header) {
+  BottomTrack bottom_message(const op::Result& r, std_msgs::msg::Header header,
+                             const std::optional<op::Bottom>& geometry, op::BottomMode mode,
+                             const builtin_interfaces::msg::Time& previous_stamp) const {
     header.frame_id = frame_;
     BottomTrack t;
     t.header = header;
     t.track_id = r.track_id;
-    t.last_observation_stamp = bottom_output_.last_observation_stamp;
+    t.last_observation_stamp = previous_stamp;
     const double age = (now() - rclcpp::Time(header.stamp)).seconds();
-    t.valid = r.body_valid && r.bottom_valid && r.bottom.has_value() && age >= -.05 &&
+    t.valid = r.body_valid && geometry && mode != op::BottomMode::None && age >= -.05 &&
               age <= cfg_.prediction_s;
+    if (!t.valid) return t;
+    const auto& b = *geometry;
+    t.observation_mode = static_cast<uint8_t>(mode);
+    if (mode != op::BottomMode::BodyInferred) t.last_observation_stamp = header.stamp;
+    t.center = point(r.pose.world(b.center));
+    const op::Point normal =
+        (r.pose.world(b.normal) - r.pose.world(op::Point::Zero())).normalized();
+    t.normal.x = normal.x();
+    t.normal.y = normal.y();
+    t.normal.z = normal.z();
+    t.radius = b.radius;
+    t.plane_rmse = b.plane_rmse;
+    t.boundary_residual = b.boundary_residual;
+    t.plane_points = b.plane_points;
+    t.current_points = b.current_points;
+    t.side_points = b.side_points;
+    t.confidence = mode == op::BottomMode::BodyInferred
+                       ? 0
+                       : std::clamp(1. - b.plane_rmse / cfg_.bottom.max_plane_rmse, 0., 1.);
+    return t;
+  }
+  void publish_bottom(const op::Result& r, std_msgs::msg::Header header) {
+    header.frame_id = frame_;
+    auto measured = bottom_message(r, header, r.bottom,
+                                   r.bottom_valid ? op::BottomMode::Direct : op::BottomMode::None,
+                                   bottom_direct_stamp_);
+    if (measured.valid) {
+      bottom_direct_stamp_ = measured.last_observation_stamp;
+      ++bottom_observed_;
+    }
+    bottom_->publish(measured);
+    // Retain the exact plane timestamp even when processing latency prevents
+    // publishing that frame as fresh. Later body inference must not inherit a
+    // timestamp from another track or from an earlier published observation.
+    if (r.tracked_bottom && r.bottom_tracking_mode != op::BottomMode::BodyInferred &&
+        r.bottom_tracking_mode != op::BottomMode::None) {
+      bottom_tracking_stamp_ = header.stamp;
+    }
+    auto t =
+        bottom_message(r, header, r.tracked_bottom, r.bottom_tracking_mode, bottom_tracking_stamp_);
     visualization_msgs::msg::MarkerArray markers;
     auto ring = base_marker(header, 0, Marker::LINE_STRIP, "bucket_bottom");
     ring.action = Marker::DELETE;
@@ -468,7 +512,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     }
     op::Points plane;
     if (t.valid) {
-      const auto& b = *r.bottom;
+      const auto& b = *r.tracked_bottom;
       const auto center = r.pose.world(b.center);
       const op::Point normal =
           (r.pose.world(b.normal) - r.pose.world(op::Point::Zero())).normalized();
@@ -481,27 +525,16 @@ class BucketOpeningTracker : public rclcpp::Node {
       basis.col(1) = normal.cross(x_axis);
       basis.col(2) = normal;
       const Eigen::Quaterniond orientation(basis);
-      t.last_observation_stamp = header.stamp;
-      t.center = point(center);
-      t.normal.x = normal.x();
-      t.normal.y = normal.y();
-      t.normal.z = normal.z();
-      t.radius = b.radius;
-      t.plane_rmse = b.plane_rmse;
-      t.boundary_residual = b.boundary_residual;
-      t.plane_points = b.plane_points;
-      t.current_points = b.current_points;
-      t.side_points = b.side_points;
-      t.confidence = std::clamp(1. - b.plane_rmse / cfg_.bottom.max_plane_rmse, 0., 1.);
       ring.action = Marker::ADD;
       ring.scale.x = .012;
-      ring.color.r = 1;
-      ring.color.g = .55;
+      const bool inferred = t.observation_mode == BottomTrack::BODY_INFERRED;
+      ring.color.r = inferred ? 0 : 1;
+      ring.color.g = t.observation_mode == BottomTrack::DIRECT ? .55 : 1;
+      ring.color.b = inferred ? 1 : 0;
       center_marker.action = Marker::ADD;
       center_marker.pose.position = t.center;
       center_marker.scale.x = center_marker.scale.y = center_marker.scale.z = .045;
-      center_marker.color.r = 1;
-      center_marker.color.g = .55;
+      center_marker.color = ring.color;
       for (int axis = 0; axis < 3; ++axis) {
         auto& marker = axes[axis];
         marker.action = Marker::ADD;
@@ -529,13 +562,15 @@ class BucketOpeningTracker : public rclcpp::Node {
         const double a = i * 2 * 3.141592653589793 / 64;
         ring.points.push_back(point(center + b.radius * (std::cos(a) * u + std::sin(a) * v)));
       }
-      for (const auto& p : tracker_->accumulated_cloud()) {
-        if (std::abs(b.normal.dot(p - b.center)) <= cfg_.bottom.plane_distance &&
-            (p.head<2>() - b.center.head<2>()).norm() <= b.radius + cfg_.bottom.plane_distance)
-          plane.push_back(r.pose.world(p));
+      for (const auto& p : tracker_->selected_cloud()) {
+        const auto local = r.pose.local(p);
+        if (t.observation_mode != BottomTrack::BODY_INFERRED &&
+            std::abs(b.normal.dot(local - b.center)) <= cfg_.bottom.plane_distance &&
+            (local.head<2>() - b.center.head<2>()).norm() <= b.radius + cfg_.bottom.plane_distance)
+          plane.push_back(p);
       }
       bottom_received_ = std::chrono::steady_clock::now();
-      ++bottom_observed_;
+      ++bottom_tracked_;
     }
     markers.markers.push_back(ring);
     markers.markers.push_back(center_marker);
@@ -543,7 +578,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     bottom_markers_->publish(markers);
     bottom_cloud_->publish(make_cloud(plane, header));
     bottom_output_ = t;
-    bottom_->publish(t);
+    bottom_track_->publish(t);
   }
   void show_final(const Track& track) {
     visualization_msgs::msg::MarkerArray a;
@@ -675,7 +710,9 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("body_registered_frames", body_frames_);
     add("robot_has_motion_evidence", last_result_.motion_seeded);
     add("bottom_observed_frames", bottom_observed_);
-    add("bottom_valid", bottom_output_.valid);
+    add("bottom_tracking_valid", bottom_output_.valid);
+    add("bottom_tracking_mode", bottom_output_.observation_mode);
+    add("bottom_tracked_frames", bottom_tracked_);
     add("bottom_plane_points", last_result_.bottom ? last_result_.bottom->plane_points : 0);
     add("bottom_current_points", last_result_.bottom ? last_result_.bottom->current_points : 0);
     add("bottom_side_points", last_result_.bottom ? last_result_.bottom->side_points : 0);
@@ -721,10 +758,11 @@ class BucketOpeningTracker : public rclcpp::Node {
   std::unique_ptr<tf2_ros::TransformListener> listener_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> broadcaster_;
   rclcpp::Publisher<Track>::SharedPtr raw_;
-  rclcpp::Publisher<BottomTrack>::SharedPtr bottom_;
+  rclcpp::Publisher<BottomTrack>::SharedPtr bottom_, bottom_track_;
+  builtin_interfaces::msg::Time bottom_direct_stamp_, bottom_tracking_stamp_;
   BottomTrack bottom_output_;
   std::chrono::steady_clock::time_point bottom_received_;
-  uint64_t bottom_observed_{0};
+  uint64_t bottom_observed_{0}, bottom_tracked_{0};
   rclcpp::Publisher<Cloud>::SharedPtr selected_, accumulated_, bottom_cloud_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_, robot_markers_,
