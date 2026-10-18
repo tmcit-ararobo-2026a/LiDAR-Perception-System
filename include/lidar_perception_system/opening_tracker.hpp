@@ -52,7 +52,7 @@ struct Config {
   double min_arc{2.09439510239}, height_change_m{0.03}, min_lip_width{0.003};
   int min_rim_points{12}, min_current_points{4}, min_side_points{8};
   int ransac_iterations{80}, confirm_hits{3};
-  double prediction_s{0.3}, reset_s{2.0}, association_m{0.65};
+  double prediction_s{0.3}, reset_s{2.0}, association_m{0.65}, body_recovery_s{0.6};
   BottomConfig bottom;
   bool inside_field(const Point& p) const;
   void validate() const;
@@ -86,6 +86,8 @@ struct FitStats {
 
 struct Result {
   bool valid{false}, predicted{false}, body_valid{false};
+  bool body_recovered{false};
+  int recovery_attempts{0};
   bool motion_seeded{false};
   bool bottom_valid{false};
   double bottom_observation_stamp{0};

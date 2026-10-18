@@ -98,6 +98,7 @@ op::Config read_config(const nlohmann::json& j) {
   READ(tracking, confirm_hits);
   READ(tracking, reset_s);
   READ(tracking, association_m);
+  READ(tracking, body_recovery_s);
 #undef READ
   const auto bottom = j.value("bottom", nlohmann::json::object());
 #define READ_BOTTOM(field) c.bottom.field = bottom.value(#field, c.bottom.field)
@@ -743,6 +744,8 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("height_resets", tracker_->height_resets());
     add("body_registered_frames", body_frames_);
     add("robot_valid", body_debug_valid_);
+    add("robot_recovered", last_result_.body_recovered);
+    add("recovery_attempts", last_result_.recovery_attempts);
     add("robot_has_motion_evidence", last_result_.motion_seeded);
     add("bottom_observed_frames", bottom_observed_);
     add("bottom_tracking_valid", bottom_output_.valid);

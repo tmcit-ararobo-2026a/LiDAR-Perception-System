@@ -140,6 +140,7 @@ void Config::validate() const {
                    min_lip_width,
                    prediction_s,
                    reset_s,
+                   body_recovery_s,
                    association_m}) {
     if (!std::isfinite(v)) {
       throw std::invalid_argument("Opening config must be finite");
@@ -180,12 +181,12 @@ void Config::validate() const {
       max_opening_z - min_opening_z > 5 || max_residual <= 0 || max_plane_rmse <= 0 ||
       min_arc <= 0 || min_arc > 2 * pi || height_change_m <= 0 || min_lip_width < 0 ||
       min_lip_width > max_residual || window_s <= 0 || window_s > 5 || prediction_s <= 0 ||
-      prediction_s > reset_s || reset_s > 10 || correspondence_m <= 0 || correspondence_m > 1 ||
-      max_registration_rmse <= 0 || min_overlap <= 0 || min_overlap > 1 || association_m <= 0 ||
-      icp_iterations < 1 || icp_iterations > 100 || ransac_iterations < 1 ||
-      ransac_iterations > 1000 || min_body_points < 3 || min_rim_points < 3 ||
-      min_current_points < 3 || min_side_points < 1 || confirm_hits < 1 ||
-      max_body_points < min_body_points || max_body_points > 20000 ||
+      prediction_s > reset_s || reset_s > 10 || body_recovery_s < 0 || body_recovery_s > reset_s ||
+      correspondence_m <= 0 || correspondence_m > 1 || max_registration_rmse <= 0 ||
+      min_overlap <= 0 || min_overlap > 1 || association_m <= 0 || icp_iterations < 1 ||
+      icp_iterations > 100 || ransac_iterations < 1 || ransac_iterations > 1000 ||
+      min_body_points < 3 || min_rim_points < 3 || min_current_points < 3 || min_side_points < 1 ||
+      confirm_hits < 1 || max_body_points < min_body_points || max_body_points > 20000 ||
       max_model_points < max_body_points || max_model_points > 200000 ||
       max_frame_points < max_model_points || max_frame_points > 1000000) {
     throw std::invalid_argument("Invalid opening tracker bounds or limits");
@@ -363,9 +364,8 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
     }
     std::sort(pairs.begin(), pairs.end(),
               [](const auto& a, const auto& b) { return a.squared < b.squared; });
-    // Optimize with trimming, but rank/check the complete set of matched
-    // returns. On a regular chassis, discarding its edges can make a wrong
-    // translation by one grid period appear to have zero residual.
+    // Optimize with trimming, retaining all unique pairs so final close-match
+    // coverage is measured independently of the optimizer's trimmed subset.
     double all_squared = 0;
     for (const auto& pair : pairs) all_squared += pair.squared;
     rmse = std::sqrt(all_squared / pairs.size());
@@ -406,6 +406,21 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
       break;
     }
   }
+  // Reject far pairs individually, then require sufficient close support.
+  // An unmatched edge or fixture must not dominate the mean error of the
+  // correctly aligned part. Coverage still penalizes periodic chassis aliases.
+  complete_pairs.erase(std::remove_if(complete_pairs.begin(), complete_pairs.end(),
+                                      [&](const Pair& p) {
+                                        return p.squared > cfg_.max_registration_rmse *
+                                                               cfg_.max_registration_rmse;
+                                      }),
+                       complete_pairs.end());
+  overlap = static_cast<double>(complete_pairs.size()) /
+            std::max(size_t{1}, std::min(body.size(), reference_body_.size()));
+  if (complete_pairs.size() < 12 || overlap < cfg_.min_overlap) return false;
+  double inlier_squared = 0;
+  for (const auto& p : complete_pairs) inlier_squared += p.squared;
+  rmse = std::sqrt(inlier_squared / complete_pairs.size());
   if (rmse > cfg_.max_registration_rmse || (estimate.xy - initial.xy).norm() > cfg_.association_m ||
       std::abs(angle(estimate.yaw - initial.yaw)) > 0.65) {
     return false;
@@ -744,7 +759,9 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
                  : std::nullopt;
   const auto motion_hint = acquisition_.observe_candidates(hypotheses, stamp, acquisition_hint);
   result.candidates = static_cast<int>(candidates.size());
+  std::vector<Cluster> recovery_candidates;
   if (have_body_ && !reference_body_.empty()) {
+    recovery_candidates = std::move(candidates);
     // Sparse scans can split a robot into several connected components. Once
     // acquired, collect its predicted footprint rather than following whichever
     // fragment happens to have the nearest changing centroid.
@@ -793,9 +810,6 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   int best_evidence = -1, eligible = 0;
   bool chosen_motion = false;
   for (auto& c : candidates) {
-    if (have_body_ && (c.center - hint).norm() > cfg_.association_m + 0.5 * elapsed) {
-      continue;
-    }
     bool excluded = false;
     if (!have_body_) {
       if (rejected_center_ && stamp < rejection_until_ &&
@@ -845,6 +859,18 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       chosen_motion = moving;
     } else if (evidence == best_evidence) {
       second = std::max(second, score);
+    }
+  }
+  // A fast move can leave the old footprint before a velocity is learned.
+  // Retain field/size-filtered clusters for short, model-verified recovery.
+  if (!chosen && have_body_ && elapsed <= cfg_.body_recovery_s) {
+    double nearest = cfg_.association_m + .5 * elapsed;
+    for (auto& c : recovery_candidates) {
+      const double distance = (c.center - hint).norm();
+      if (distance < nearest) {
+        nearest = distance;
+        chosen = &c;
+      }
     }
   }
   if (!chosen) {
@@ -917,6 +943,110 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
         supported_body = std::move(alternate_support);
       }
     }
+    if ((!registered || supported_body.size() < .7 * reference_body_.size()) &&
+        elapsed <= cfg_.body_recovery_s) {
+      // Never reacquire from a centroid alone: each seed must pass the same
+      // unique correspondences, residual, overlap and 2D-shape checks as ICP.
+      std::vector<Cluster*> ranked;
+      for (auto& candidate : recovery_candidates) ranked.push_back(&candidate);
+      std::sort(ranked.begin(), ranked.end(), [&](const Cluster* a, const Cluster* b) {
+        return (a->center - initial.world(reference_center).head<2>()).squaredNorm() <
+               (b->center - initial.world(reference_center).head<2>()).squaredNorm();
+      });
+      Cluster* recovered = nullptr;
+      const auto quality = [&](double rmse, double overlap, size_t support) {
+        const double coverage = static_cast<double>(support) / reference_body_.size();
+        return rmse + cfg_.max_registration_rmse * (2 - overlap - coverage);
+      };
+      bool have_solution = registered;
+      double recovery_score =
+          registered ? quality(result.registration_rmse, result.overlap, supported_body.size())
+                     : std::numeric_limits<double>::infinity();
+      bool ambiguous = false;
+      const size_t limit = std::min(size_t{3}, ranked.size());
+      const auto principal_heading = [](const Points& points) -> std::optional<double> {
+        Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+        for (const auto& p : points) mean += p.head<2>();
+        mean /= points.size();
+        Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+        for (const auto& p : points) {
+          const Eigen::Vector2d delta = p.head<2>() - mean;
+          covariance += delta * delta.transpose();
+        }
+        const Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> eigen(covariance);
+        if (eigen.info() != Eigen::Success ||
+            eigen.eigenvalues()[1] < 1.2 * std::max(1e-6, eigen.eigenvalues()[0]))
+          return std::nullopt;
+        const auto direction = eigen.eigenvectors().col(1);
+        return std::atan2(direction.y(), direction.x());
+      };
+      const auto model_heading = principal_heading(reference_body_);
+      Eigen::Vector2d model_lo = reference_body_.front().head<2>(), model_hi = model_lo;
+      for (const auto& p : reference_body_) {
+        model_lo = model_lo.cwiseMin(p.head<2>());
+        model_hi = model_hi.cwiseMax(p.head<2>());
+      }
+      for (size_t i = 0; i < limit; ++i) {
+        auto& c = *ranked[i];
+        if ((c.center - initial.world(reference_center).head<2>()).norm() >
+            cfg_.association_m + .5 * elapsed)
+          continue;
+        std::vector<double> turns{0., -.35, .35};
+        const auto observed_heading = principal_heading(c.body);
+        if (model_heading && observed_heading) {
+          const double turn = std::remainder(*observed_heading - *model_heading - initial.yaw, pi);
+          if (std::abs(turn) < .85) turns.insert(turns.begin(), turn);
+        } else {
+          turns.push_back(-.175);
+          turns.push_back(.175);
+        }
+        for (double turn : turns) {
+          Pose seed = initial, fitted;
+          seed.yaw = angle(seed.yaw + turn);
+          seed.xy += c.center - seed.world(reference_center).head<2>();
+          Points support;
+          double rmse = 0, overlap = 0;
+          ++result.recovery_attempts;
+          if (!register_body(c.body, seed, fitted, rmse, overlap, &support) ||
+              !body_size_valid(support) ||
+              (fitted.xy - initial.xy).norm() > cfg_.association_m + .5 * elapsed)
+            continue;
+          if (registered) {
+            Eigen::Vector2d lo = fitted.local(c.body.front()).head<2>(), hi = lo;
+            for (const auto& p : c.body) {
+              const auto local = fitted.local(p).head<2>().eval();
+              lo = lo.cwiseMin(local);
+              hi = hi.cwiseMax(local);
+            }
+            // A partial visible fragment must not displace an already valid
+            // local match merely by being centered on the full model.
+            if (((hi - lo).array() < .8 * (model_hi - model_lo).array()).any()) continue;
+          }
+          const double score = quality(rmse, overlap, support.size());
+          const bool different = have_solution && ((fitted.xy - updated.xy).norm() > .15 ||
+                                                   std::abs(angle(fitted.yaw - updated.yaw)) > .25);
+          if (different && std::abs(score - recovery_score) < .005) ambiguous = true;
+          if (score + .0001 < recovery_score) {
+            if (score + .005 < recovery_score) ambiguous = false;
+            recovery_score = score;
+            have_solution = true;
+            recovered = &c;
+            updated = fitted;
+            result.registration_rmse = rmse;
+            result.overlap = overlap;
+            supported_body = std::move(support);
+            if (rmse < .003 && overlap > .98 &&
+                supported_body.size() > .98 * reference_body_.size())
+              break;
+          }
+        }
+      }
+      registered = have_solution && !ambiguous;
+      if (recovered && registered) {
+        chosen = recovered;
+        result.body_recovered = true;
+      }
+    }
     if (!registered) {
       if (!confirmed_) {
         hits_ = 0;
@@ -935,7 +1065,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   pose_ = updated;
   motion_seeded_ = motion_seeded_ || chosen_motion;
   body_stamp_ = stamp;
-  cluster_center_ = chosen->center;
+  cluster_center_ = pose_.xy;
   result.body_valid = true;
   selected_ = chosen->body;
   Point lo = Point::Constant(std::numeric_limits<double>::infinity()), hi = -lo;

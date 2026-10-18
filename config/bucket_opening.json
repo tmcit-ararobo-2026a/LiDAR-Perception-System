@@ -49,7 +49,7 @@
   },
   "tracking": {
     "confirm_hits": 3, "max_prediction_s": 0.3,
-    "reset_s": 2.0, "association_m": 0.65
+    "reset_s": 2.0, "association_m": 0.65, "body_recovery_s": 0.6
   },
   "tf_wait_s": 0.2,
   "queue_size": 4,
