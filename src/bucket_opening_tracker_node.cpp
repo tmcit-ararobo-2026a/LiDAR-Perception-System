@@ -494,8 +494,8 @@ class BucketOpeningTracker : public rclcpp::Node {
     // Retain the exact plane timestamp even when processing latency prevents
     // publishing that frame as fresh. Later body inference must not inherit a
     // timestamp from another track or from an earlier published observation.
-    if (r.tracked_bottom && r.bottom_tracking_mode != op::BottomMode::BodyInferred &&
-        r.bottom_tracking_mode != op::BottomMode::None) {
+    if (r.bottom_tracking_observation_stamp > 0 &&
+        r.bottom_tracking_observation_stamp == r.stamp) {
       bottom_tracking_stamp_ = header.stamp;
     }
     auto t =

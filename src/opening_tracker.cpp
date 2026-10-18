@@ -843,7 +843,6 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     height_pending_ = true;
     acquired_stamp_ = stamp;
     last_opening_.reset();
-    learned_bottom_.reset();
     ++height_resets_;
   }
   Frame frame;
@@ -868,7 +867,6 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
     bottom_hits_ = 0;
     last_bottom_.reset();
-    learned_bottom_.reset();
     confirmed_ = false;
     hits_ = 0;
     last_opening_.reset();
@@ -898,16 +896,18 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     const double age = stamp - learned_bottom_stamp_;
     // Never revive an expired semantic anchor from an arbitrary nearby plane.
     if (age < 0 ||
-        (cfg_.bottom.max_body_inference_s > 0 && age > cfg_.bottom.max_body_inference_s) ||
-        (bottom && (bottom->center - learned_bottom_->center).norm() > .08)) {
+        (cfg_.bottom.max_body_inference_s > 0 && age > cfg_.bottom.max_body_inference_s)) {
       learned_bottom_.reset();
     } else if (auto plane = track_bucket_bottom(*learned_bottom_, upper, cfg_)) {
       learned_bottom_ = plane;
       learned_bottom_stamp_ = stamp;
       result.bottom_tracking_mode = BottomMode::PlaneTracked;
-    } else {
+    } else if (!bottom ||
+               (bottom->center - learned_bottom_->center).norm() <= cfg_.height_change_m) {
       result.bottom_tracking_mode = BottomMode::BodyInferred;
     }
+    // An unconfirmed contradictory candidate suppresses this frame, but must
+    // not erase a recognized mount. Replace the anchor only after confirmation.
   }
   if (learned_bottom_ && result.bottom_tracking_mode != BottomMode::None) {
     result.tracked_bottom = learned_bottom_;
@@ -931,7 +931,6 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     height_pending_ = true;
     acquired_stamp_ = stamp;
     last_opening_.reset();
-    learned_bottom_.reset();
     result.tracked_bottom.reset();
     result.bottom_tracking_mode = BottomMode::None;
     ++height_resets_;
