@@ -230,6 +230,15 @@ class BucketOpeningTracker : public rclcpp::Node {
         header.stamp = now();
         publish_bottom(op::Result{}, header);
       }
+      if (body_debug_valid_ &&
+          (std::chrono::steady_clock::now() - body_debug_received_ >
+               std::chrono::duration<double>(cfg_.prediction_s) ||
+           (now() - rclcpp::Time(body_debug_header_.stamp)).seconds() > cfg_.prediction_s ||
+           now() < rclcpp::Time(body_debug_header_.stamp))) {
+        auto header = body_debug_header_;
+        header.stamp = now();
+        debug(op::Result{}, header);
+      }
     });
     RCLCPP_INFO(get_logger(),
                 "CPU opening tracker ready; explicit map ROI, %.2fs robot-frame window",
@@ -253,6 +262,7 @@ class BucketOpeningTracker : public rclcpp::Node {
       auto header = cloud->header;
       header.stamp = now();
       publish_bottom(op::Result{}, header);
+      debug(op::Result{}, header);
       return;
     }
     const int64_t stamp = rclcpp::Time(cloud->header.stamp).nanoseconds();
@@ -261,12 +271,14 @@ class BucketOpeningTracker : public rclcpp::Node {
       auto header = cloud->header;
       header.stamp = now();
       publish_bottom(op::Result{}, header);
+      debug(op::Result{}, header);
       return;
     }
     if (last_input_ns_ > 0 && stamp < last_input_ns_) {
       queue_.clear();
       tracker_->reset();
       publish_bottom(op::Result{}, cloud->header);
+      debug(op::Result{}, cloud->header);
       last_observation_ = builtin_interfaces::msg::Time();
       ++rewinds_;
     }
@@ -289,6 +301,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     t.last_observation_stamp = last_observation_;
     raw_->publish(t);
     publish_bottom(op::Result{}, header);
+    debug(op::Result{}, header);
     reason_ = why;
     last_result_.valid = false;
   }
@@ -389,9 +402,7 @@ class BucketOpeningTracker : public rclcpp::Node {
       if (last_result_.predicted) {
         ++predicted_;
       }
-      if (last_result_.body_valid) {
-        debug(last_result_, item.cloud->header);
-      }
+      debug(last_result_, item.cloud->header);
     } catch (const std::exception& e) {
       ++errors_;
       invalid(item.cloud->header, e.what());
@@ -494,8 +505,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     // Retain the exact plane timestamp even when processing latency prevents
     // publishing that frame as fresh. Later body inference must not inherit a
     // timestamp from another track or from an earlier published observation.
-    if (r.bottom_tracking_observation_stamp > 0 &&
-        r.bottom_tracking_observation_stamp == r.stamp) {
+    if (r.bottom_tracking_observation_stamp > 0 && r.bottom_tracking_observation_stamp == r.stamp) {
       bottom_tracking_stamp_ = header.stamp;
     }
     auto t =
@@ -632,17 +642,26 @@ class BucketOpeningTracker : public rclcpp::Node {
   }
   void debug(const op::Result& r, std_msgs::msg::Header header) {
     header.frame_id = frame_;
+    const double age = (now() - rclcpp::Time(header.stamp)).seconds();
+    const bool fresh = r.body_valid && age >= -.05 && age <= cfg_.prediction_s;
+    body_debug_valid_ = fresh;
+    if (fresh) {
+      body_debug_header_ = header;
+      body_debug_received_ = std::chrono::steady_clock::now();
+    }
     if (selected_->get_subscription_count()) {
-      selected_->publish(make_cloud(tracker_->selected_cloud(), header));
+      selected_->publish(make_cloud(fresh ? tracker_->selected_cloud() : op::Points{}, header));
     }
     if (accumulated_->get_subscription_count()) {
       op::Points map;
       map.reserve(tracker_->accumulated_cloud().size());
-      for (const auto& p : tracker_->body_model()) {
-        map.push_back(r.pose.world(p));
-      }
-      for (const auto& p : tracker_->accumulated_cloud()) {
-        map.push_back(r.pose.world(p));
+      if (fresh) {
+        for (const auto& p : tracker_->body_model()) {
+          map.push_back(r.pose.world(p));
+        }
+        for (const auto& p : tracker_->accumulated_cloud()) {
+          map.push_back(r.pose.world(p));
+        }
       }
       accumulated_->publish(make_cloud(map, header));
     }
@@ -653,13 +672,22 @@ class BucketOpeningTracker : public rclcpp::Node {
     tf.transform.translation.y = r.pose.xy.y();
     tf.transform.rotation.z = std::sin(r.pose.yaw / 2);
     tf.transform.rotation.w = std::cos(r.pose.yaw / 2);
-    broadcaster_->sendTransform(tf);
+    if (fresh) {
+      auto base = tf;
+      base.child_frame_id = "lps_base_link";
+      broadcaster_->sendTransform(std::vector<geometry_msgs::msg::TransformStamped>{tf, base});
+    }
     if (!robot_markers_->get_subscription_count()) {
       return;
     }
     visualization_msgs::msg::MarkerArray a;
     for (int axis = 0; axis < 3; ++axis) {
       auto m = base_marker(header, axis, Marker::ARROW, "robot_frame");
+      if (!fresh) {
+        m.action = Marker::DELETE;
+        a.markers.push_back(m);
+        continue;
+      }
       m.scale.x = 0.02;
       m.scale.y = 0.04;
       m.scale.z = 0.06;
@@ -708,6 +736,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("registration_overlap", last_result_.overlap);
     add("height_resets", tracker_->height_resets());
     add("body_registered_frames", body_frames_);
+    add("robot_valid", body_debug_valid_);
     add("robot_has_motion_evidence", last_result_.motion_seeded);
     add("bottom_observed_frames", bottom_observed_);
     add("bottom_tracking_valid", bottom_output_.valid);
@@ -761,6 +790,9 @@ class BucketOpeningTracker : public rclcpp::Node {
   rclcpp::Publisher<BottomTrack>::SharedPtr bottom_, bottom_track_;
   builtin_interfaces::msg::Time bottom_direct_stamp_, bottom_tracking_stamp_;
   BottomTrack bottom_output_;
+  bool body_debug_valid_{false};
+  std_msgs::msg::Header body_debug_header_;
+  std::chrono::steady_clock::time_point body_debug_received_;
   std::chrono::steady_clock::time_point bottom_received_;
   uint64_t bottom_observed_{0}, bottom_tracked_{0};
   rclcpp::Publisher<Cloud>::SharedPtr selected_, accumulated_, bottom_cloud_;

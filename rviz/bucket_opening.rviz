@@ -118,6 +118,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
+      Target Frame: lps_base_link
       Distance: 13
       Focal Point:
         X: 0
