@@ -49,7 +49,8 @@ Points voxelize(const Points& input, double size, size_t limit) {
   for (const auto& item : cells) {
     ordered.push_back({item.first, item.second.sum / item.second.count});
   }
-  // Stable spatial ordering also makes decimation independent of hash iteration order.
+  // Stable spatial ordering also makes decimation independent of hash iteration
+  // order.
   std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
     return std::tie(a.first.x, a.first.y, a.first.z) < std::tie(b.first.x, b.first.y, b.first.z);
   });
@@ -133,6 +134,24 @@ void Config::validate() const {
       throw std::invalid_argument("Opening config must be finite");
     }
   }
+  for (double v :
+       {bottom.bucket_height, bottom.height_tolerance, bottom.min_radius, bottom.max_radius,
+        bottom.plane_distance, bottom.max_plane_rmse, bottom.max_tilt_rad, bottom.connection_m,
+        bottom.side_tolerance, bottom.min_side_span}) {
+    if (!std::isfinite(v)) throw std::invalid_argument("Bottom config must be finite");
+  }
+  if (bottom.bucket_height < .1 || bottom.bucket_height > .5 || bottom.height_tolerance < 0 ||
+      bottom.height_tolerance > .08 || bottom.min_radius < .02 ||
+      bottom.max_radius <= bottom.min_radius || bottom.max_radius > max_radius ||
+      bottom.plane_distance < .003 || bottom.plane_distance > .025 || bottom.max_plane_rmse <= 0 ||
+      bottom.max_plane_rmse > bottom.plane_distance || bottom.max_tilt_rad <= 0 ||
+      bottom.max_tilt_rad > .35 || bottom.connection_m < .01 || bottom.connection_m > .08 ||
+      bottom.side_tolerance <= 0 || bottom.side_tolerance > .05 || bottom.min_side_span < .05 ||
+      bottom.min_side_span > bottom.bucket_height || bottom.min_plane_points < 6 ||
+      bottom.min_plane_points > max_model_points || bottom.min_current_points < 3 ||
+      bottom.min_side_points < 3) {
+    throw std::invalid_argument("Invalid bottom geometry bounds");
+  }
   if (min_x >= max_x || min_y >= max_y || min_z >= max_z ||
       std::max({std::abs(min_x), std::abs(max_x), std::abs(min_y), std::abs(max_y), std::abs(min_z),
                 std::abs(max_z)}) > 100 ||
@@ -172,6 +191,9 @@ void Tracker::clear_model() {
   height_pending_ = false;
   hits_ = 0;
   last_opening_.reset();
+  last_bottom_.reset();
+  bottom_hits_ = 0;
+  bottom_stamp_ = 0;
   body_stamp_ = 0;
   acquired_stamp_ = 0;
   rejection_until_ = 0;
@@ -461,7 +483,8 @@ std::optional<Opening> Tracker::fit_opening(const Points& input, const Points& c
           ++above;
         }
       }
-      // A side-wall cross section has continuing shell above it, unlike a top edge.
+      // A side-wall cross section has continuing shell above it, unlike a top
+      // edge.
       if (below < cfg_.min_side_points || above >= 3) {
         continue;
       }
@@ -531,8 +554,9 @@ void Tracker::rebuild(double stamp) {
     body.insert(body.end(), frame.body.begin(), frame.body.end());
     upper.insert(upper.end(), frame.upper.begin(), frame.upper.end());
   }
-  // Keep a last-good registration reference during short occlusions. Its age never
-  // counts as a new opening observation, and it is removed by the reset deadline.
+  // Keep a last-good registration reference during short occlusions. Its age
+  // never counts as a new opening observation, and it is removed by the reset
+  // deadline.
   if (!body.empty()) {
     reference_body_ = voxelize(body, cfg_.body_voxel, cfg_.max_body_points);
   }
@@ -543,6 +567,7 @@ Result Tracker::missing(double stamp, const std::string& reason, Result result) 
   result.track_id = track_id_;
   result.pose = pose_;
   result.motion_seeded = motion_seeded_;
+  result.bottom_observation_stamp = bottom_stamp_;
   result.reason = reason;
   result.observation_stamp = observation_stamp_;
   result.model_points = static_cast<int>(accumulated_.size());
@@ -600,7 +625,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   rebuild(stamp);
   Points filtered;
   filtered.reserve(std::min(map_points.size(), static_cast<size_t>(cfg_.max_frame_points)));
-  // Uniform input decimation bounds work without retaining the first spatial sector only.
+  // Uniform input decimation bounds work without retaining the first spatial
+  // sector only.
   const size_t stride =
       std::max(size_t{1}, (map_points.size() + cfg_.max_frame_points - 1) / cfg_.max_frame_points);
   for (size_t i = 0; i < map_points.size(); i += stride) {
@@ -691,9 +717,9 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     int upper = 0;
     Points upper_context;
     for (const auto& p : filtered) {
-      if (p.z() >= cfg_.min_opening_z - 0.25 && p.x() > c.min_x - cfg_.crop_margin &&
-          p.x() < c.max_x + cfg_.crop_margin && p.y() > c.min_y - cfg_.crop_margin &&
-          p.y() < c.max_y + cfg_.crop_margin) {
+      if (p.z() >= cfg_.min_opening_z - cfg_.bottom.bucket_height - cfg_.bottom.height_tolerance &&
+          p.x() > c.min_x - cfg_.crop_margin && p.x() < c.max_x + cfg_.crop_margin &&
+          p.y() > c.min_y - cfg_.crop_margin && p.y() < c.max_y + cfg_.crop_margin) {
         if (p.z() >= cfg_.min_opening_z) ++upper;
         if (!have_body_) upper_context.push_back(p);
       }
@@ -705,8 +731,11 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     if (!have_body_) {
       if (moving) evidence = 1;
       if (const auto opening = fit_opening(upper_context, upper_context)) {
-        evidence = 2;
+        evidence = 3;
         score += opening->score;
+      } else if (const auto bottom = fit_bucket_bottom(upper_context, upper_context, cfg_)) {
+        evidence = 2;
+        score += bottom->score;
       }
     }
     if (evidence > best_evidence || (evidence == best_evidence && score > best)) {
@@ -767,7 +796,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   }
   Points upper;
   for (const auto& p : selected_) {
-    if (p.z() > cfg_.min_opening_z - 0.25) {
+    if (p.z() >= cfg_.min_opening_z - cfg_.bottom.bucket_height - cfg_.bottom.height_tolerance) {
       upper.push_back(pose_.local(p));
     }
   }
@@ -790,11 +819,43 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   frame.body = local_points(chosen->body, pose_);
   frame.upper = upper;
   frames_.push_back(std::move(frame));
-  // At most 100 accepted scans per second; protect memory under pathological timestamp rates.
+  // At most 100 accepted scans per second; protect memory under pathological
+  // timestamp rates.
   while (frames_.size() > 100) {
     frames_.pop_front();
   }
   rebuild(stamp);
+  auto bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
+  if (bottom && last_bottom_ &&
+      std::abs(bottom->center.z() - last_bottom_->center.z()) > cfg_.height_change_m) {
+    // The bucket may lift relative to the chassis. Do not blend its old and new
+    // heights or keep an old opening observation alive through the lift.
+    for (auto& previous : frames_) previous.upper.clear();
+    frames_.back().upper = upper;
+    rebuild(stamp);
+    bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
+    bottom_hits_ = 0;
+    last_bottom_.reset();
+    confirmed_ = false;
+    hits_ = 0;
+    last_opening_.reset();
+    ++height_resets_;
+  }
+  if (bottom) {
+    const bool consistent =
+        last_bottom_ && stamp - bottom_stamp_ <= cfg_.prediction_s &&
+        (bottom->center.head<2>() - last_bottom_->center.head<2>()).norm() < .08 &&
+        std::abs(bottom->center.z() - last_bottom_->center.z()) <= cfg_.height_change_m;
+    bottom_hits_ = consistent ? std::min(cfg_.confirm_hits, bottom_hits_ + 1) : 1;
+    last_bottom_ = bottom;
+    bottom_stamp_ = stamp;
+    result.bottom = bottom;
+    result.bottom_valid = bottom_hits_ >= cfg_.confirm_hits;
+    if (result.bottom_valid) identified_ = true;
+  } else {
+    bottom_hits_ = 0;
+  }
+  result.bottom_observation_stamp = bottom_stamp_;
   auto opening = fit_opening(accumulated_, upper, &result.fit);
   if (opening && last_opening_ &&
       std::abs(opening->center.z() - last_opening_->center.z()) > cfg_.height_change_m) {

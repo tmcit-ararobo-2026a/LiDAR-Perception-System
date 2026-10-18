@@ -78,6 +78,27 @@ Visualization Manager:
         Reliability Policy: Reliable
         Durability Policy: Volatile
         Depth: 2
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Bucket Bottom (observed)
+      Topic:
+        Value: /bucket_opening_tracker/bottom_markers
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        Depth: 2
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: Bucket Bottom Plane
+      Topic:
+        Value: /bucket_opening_tracker/bottom_cloud
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        Depth: 2
+      Style: Points
+      Size (Pixels): 5
+      Color Transformer: FlatColor
+      Color: 255; 140; 0
+      Decay Time: 0
     - Class: rviz_default_plugins/TF
       Enabled: true
       Name: TF (optional)

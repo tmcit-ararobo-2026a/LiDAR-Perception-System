@@ -16,12 +16,13 @@ find_package(std_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 # CPU-only geometry is shared by the new tracker and local synthetic checks.
-add_library(opening_tracking_core STATIC src/opening_tracker.cpp)
+add_library(opening_tracking_core STATIC src/opening_tracker.cpp src/bucket_bottom.cpp)
 target_include_directories(opening_tracking_core PUBLIC include)
 target_link_libraries(opening_tracking_core PUBLIC Eigen3::Eigen)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MovingBucketTrack.msg"
+  "msg/BucketBottom.msg"
   DEPENDENCIES std_msgs builtin_interfaces geometry_msgs)
 
 if(BUILD_RUNTIME_NODES)
@@ -73,6 +74,11 @@ if(BUILD_TESTING)
   target_include_directories(support_tracker_test PRIVATE include)
   target_link_libraries(support_tracker_test Eigen3::Eigen)
   add_test(NAME support_tracker_test COMMAND support_tracker_test)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bucket_bottom_test.cpp")
+    add_executable(bucket_bottom_test test/bucket_bottom_test.cpp)
+    target_link_libraries(bucket_bottom_test opening_tracking_core)
+    add_test(NAME bucket_bottom_test COMMAND bucket_bottom_test)
+  endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/opening_tracker_test.cpp")
     add_executable(opening_tracker_test test/opening_tracker_test.cpp)
     target_link_libraries(opening_tracker_test opening_tracking_core)
@@ -83,6 +89,13 @@ if(BUILD_TESTING)
     ament_add_pytest_test(track_freshness_guard_test test/track_freshness_guard_test.py
       ENV TRACK_GUARD_EXECUTABLE=$<TARGET_FILE:track_freshness_guard_node>
       TIMEOUT 30)
+  endif()
+  if(BUILD_RUNTIME_NODES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/bucket_bottom_ros_test.py")
+    find_package(ament_cmake_pytest REQUIRED)
+    ament_add_pytest_test(bucket_bottom_ros_test test/bucket_bottom_ros_test.py
+      ENV OPENING_TRACKER_EXECUTABLE=$<TARGET_FILE:bucket_opening_tracker>
+          OPENING_CONFIG=${CMAKE_CURRENT_SOURCE_DIR}/config/bucket_opening.json
+      TIMEOUT 45)
   endif()
   if(BUILD_RUNTIME_NODES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/opening_tracker_ros_test.py")
     find_package(ament_cmake_pytest REQUIRED)

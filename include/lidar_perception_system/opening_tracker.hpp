@@ -21,6 +21,15 @@ struct Pose {
   Point local(const Point& p) const;
 };
 
+struct BottomConfig {
+  // Standard competition bucket dimensions, not a robot mounting position.
+  double bucket_height{0.255}, height_tolerance{0.035};
+  double min_radius{0.075}, max_radius{0.135};
+  double plane_distance{0.012}, max_plane_rmse{0.008}, max_tilt_rad{0.1745329252};
+  double connection_m{0.035}, side_tolerance{0.030}, min_side_span{0.12};
+  int min_plane_points{20}, min_current_points{4}, min_side_points{6};
+};
+
 struct Config {
   double min_x{-5}, max_x{5}, min_y{-5}, max_y{5};
   double min_z{0.10}, max_z{2.20}, self_radius{0.8};
@@ -38,6 +47,7 @@ struct Config {
   int min_rim_points{12}, min_current_points{4}, min_side_points{8};
   int ransac_iterations{80}, confirm_hits{3};
   double prediction_s{0.3}, reset_s{2.0}, association_m{0.65};
+  BottomConfig bottom;
   void validate() const;
 };
 
@@ -46,6 +56,16 @@ struct Opening {
   double radius{0}, residual{0}, plane_rmse{0}, arc{0}, score{0};
   int points{0}, current_points{0};
 };
+
+struct Bottom {
+  Point center{0, 0, 0}, normal{0, 0, 1};
+  double radius{0}, plane_rmse{0}, boundary_residual{0}, score{0};
+  int plane_points{0}, current_points{0}, side_points{0};
+};
+
+// Geometry evidence only: no fixed mounting coordinates or opening inference.
+std::optional<Bottom> fit_bucket_bottom(const Points& accumulated, const Points& current,
+                                        const Config& config);
 
 struct FitStats {
   int max_slice_points{0}, radius_hypotheses{0}, geometry_hypotheses{0}, edge_hypotheses{0};
@@ -57,6 +77,9 @@ struct FitStats {
 struct Result {
   bool valid{false}, predicted{false}, body_valid{false};
   bool motion_seeded{false};
+  bool bottom_valid{false};
+  double bottom_observation_stamp{0};
+  std::optional<Bottom> bottom;
   unsigned int track_id{0};
   double stamp{0}, observation_stamp{0}, confidence{0}, position_variance{1};
   Point position{0, 0, 0}, velocity{0, 0, 0};
@@ -113,6 +136,9 @@ class Tracker {
   int hits_{0};
   unsigned int next_id_{0}, track_id_{0}, height_resets_{0};
   std::optional<Opening> last_opening_;
+  std::optional<Bottom> last_bottom_;
+  int bottom_hits_{0};
+  double bottom_stamp_{0};
   Point position_{0, 0, 0}, measured_{0, 0, 0}, velocity_{0, 0, 0};
   double observation_stamp_{0}, variance_{1};
 };

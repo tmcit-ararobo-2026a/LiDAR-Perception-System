@@ -18,7 +18,7 @@ import rclpy
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from diagnostic_msgs.msg import DiagnosticArray
-from lidar_perception_system.msg import MovingBucketTrack
+from lidar_perception_system.msg import MovingBucketTrack, BucketBottom
 from sensor_msgs.msg import PointCloud2
 from tf2_msgs.msg import TFMessage
 
@@ -109,6 +109,15 @@ def main():
     reasons = {}
     subscriptions = []
     cloud_count = [0]
+    bottom_observations = {}
+    def bottom(message):
+        if not in_evaluation(message.header.stamp):
+            return
+        stamp = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
+        if message.valid:
+            bottom_observations[stamp] = message.track_id
+    subscriptions.append(node.create_subscription(BucketBottom,
+        '/bucket_opening_tracker/bottom', bottom, 100))
     subscriptions.append(node.create_subscription(PointCloud2, config['input_topic'],
         lambda m: cloud_count.__setitem__(0, cloud_count[0] + int(in_evaluation(m.header.stamp))),
         rclpy.qos.qos_profile_sensor_data))
@@ -221,6 +230,9 @@ def main():
                 'guarded_invalid_reports': stream['final_invalid_reports'],
                 'valid_track_ids': len({track for valid, _, track in measured if valid})}
         report['opening_confirmed'] = report['streams']['opening']['direct_results'] > 0
+        report['bottom'] = {'valid_measurements': len(bottom_observations),
+                            'track_ids': len(set(bottom_observations.values())),
+                            'accuracy_evaluated': False}
         args.output.write_text(json.dumps(report, indent=2) + '\n')
         print(json.dumps(report, indent=2))
         if (cloud_count[0] == 0 or not streams['opening']['raw']
