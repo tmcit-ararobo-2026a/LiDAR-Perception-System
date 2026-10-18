@@ -188,6 +188,14 @@ JSONの`bottom`で次を設定できます。
 
 探索する底面高さは、開口の許容高さからバケツ高さを引いて導出します。取付位置の探索範囲は相手ROIと`robot.crop_margin`にも依存します。底面・側面が完全に隠れる、透明材から十分な反射が返らない、同形状の物体と区別できない場合は未確定です。ルールの共通バケツを対象とする方式であり、任意の形状・遮蔽・機体に対する成功保証ではありません。別の実ロボットでの検出率は未受入です。
 
+### 旧マーカーから新しい底面表示へ切り替える
+
+`/moving_bucket_detector/markers`は従来方式の出力です。`moving_bucket.launch.py`や`moving_bucket_rviz.launch.py`で新しい底面検出は起動しません。底面の表示は`bucket_opening_rviz.launch.py`を起動し、`/bucket_opening_tracker/bottom_markers`（橙の円）と`/bucket_opening_tracker/bottom_cloud`を確認してください。RVizのFixed Frameは`map`です。`/bucket_opening_tracker/markers`は開口の結果です。
+
+既存RVizを使う場合はMarkerArray表示を追加して`/bucket_opening_tracker/bottom_markers`を選びます。別途`bucket_opening.launch.py`で新ノードを起動する必要があります。検出が未確定または失効したときは底面markerを削除するため、常時表示されるものではありません。
+
+比較画像の「横位置」は画像用に原点を移した相対座標で、mapのX/Y座標そのものではありません。画像上の横位置をそのままRVizの座標へ指定しないでください。設定ファイルは再起動後も残る場所へ保存してください。`input_topic`を`/dynamic_cloud`にする場合は、そのpublisherが自己位置推定から配信されていることも確認します。
+
 ### 出力とRViz
 
 | 名前 | 内容 |
