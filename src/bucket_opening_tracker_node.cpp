@@ -71,6 +71,7 @@ op::Config read_config(const nlohmann::json& j) {
   READ(registration, correspondence_m);
   READ(registration, max_registration_rmse);
   READ(registration, min_overlap);
+  READ(registration, min_support_spread_ratio);
   READ(registration, icp_iterations);
   READ(opening, min_opening_z);
   READ(opening, max_opening_z);

@@ -41,6 +41,7 @@ struct Config {
   double body_voxel{0.03}, opening_voxel{0.01}, window_s{1.0};
   int max_body_points{2000}, max_model_points{20000}, max_frame_points{50000};
   double correspondence_m{0.15}, max_registration_rmse{0.05}, min_overlap{0.5};
+  double min_support_spread_ratio{0.1};
   int icp_iterations{20};
   double min_opening_z{1.2}, max_opening_z{2.1};
   double min_radius{0.110}, max_radius{0.150}, nominal_radius{0.1365};
@@ -125,7 +126,7 @@ class Tracker {
   };
   std::vector<Cluster> clusters(const Points& points) const;
   bool register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
-                     double& overlap) const;
+                     double& overlap, Points* supported = nullptr) const;
   Result missing(double stamp, const std::string& reason, Result result = Result{});
   void clear_model();
   void rebuild(double stamp);

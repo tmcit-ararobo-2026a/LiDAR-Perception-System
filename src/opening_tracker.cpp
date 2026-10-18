@@ -116,6 +116,7 @@ void Config::validate() const {
                    correspondence_m,
                    max_registration_rmse,
                    min_overlap,
+                   min_support_spread_ratio,
                    min_opening_z,
                    max_opening_z,
                    min_radius,
@@ -153,7 +154,8 @@ void Config::validate() const {
       bottom.max_body_inference_s > 10) {
     throw std::invalid_argument("Invalid bottom geometry bounds");
   }
-  if (min_x >= max_x || min_y >= max_y || min_z >= max_z ||
+  if (min_x >= max_x || min_y >= max_y || min_z >= max_z || min_support_spread_ratio < 0 ||
+      min_support_spread_ratio > 1 ||
       std::max({std::abs(min_x), std::abs(max_x), std::abs(min_y), std::abs(max_y), std::abs(min_z),
                 std::abs(max_z)}) > 100 ||
       body_min_z < min_z || body_min_z >= body_max_z || body_max_z >= min_opening_z ||
@@ -270,7 +272,7 @@ std::vector<Tracker::Cluster> Tracker::clusters(const Points& points) const {
 }
 
 bool Tracker::register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
-                            double& overlap) const {
+                            double& overlap, Points* supported) const {
   if (reference_body_.empty()) {
     return false;
   }
@@ -280,16 +282,20 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
   }
   Pose estimate = initial;
   struct Pair {
-    Point p, q;
+    Point p, q, map;
     double squared;
   };
+  std::vector<Pair> complete_pairs;
   for (int iteration = 0; iteration <= cfg_.icp_iterations; ++iteration) {
+    // A dense wall must not vote hundreds of times for one chassis feature.
+    std::vector<std::optional<Pair>> closest(reference_body_.size());
     std::vector<Pair> pairs;
     for (const auto& map : body) {
       const Point p = estimate.local(map);
       const auto k = key(p, cfg_.correspondence_m);
       double best = cfg_.correspondence_m * cfg_.correspondence_m;
       const Point* q = nullptr;
+      size_t reference_index = 0;
       for (int dx = -1; dx <= 1; ++dx) {
         for (int dy = -1; dy <= 1; ++dy) {
           for (int dz = -1; dz <= 1; ++dz) {
@@ -302,16 +308,20 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
               if (d < best) {
                 best = d;
                 q = &reference_body_[i];
+                reference_index = i;
               }
             }
           }
         }
       }
-      if (q) {
-        pairs.push_back({p, *q, best});
+      if (q && (!closest[reference_index] || best < closest[reference_index]->squared)) {
+        closest[reference_index] = Pair{p, *q, map, best};
       }
     }
-    overlap = static_cast<double>(pairs.size()) / std::max(size_t{1}, body.size());
+    for (const auto& pair : closest)
+      if (pair) pairs.push_back(*pair);
+    overlap = static_cast<double>(pairs.size()) /
+              std::max(size_t{1}, std::min(body.size(), reference_body_.size()));
     if (overlap < cfg_.min_overlap || pairs.size() < 12) {
       return false;
     }
@@ -323,6 +333,7 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
     double all_squared = 0;
     for (const auto& pair : pairs) all_squared += pair.squared;
     rmse = std::sqrt(all_squared / pairs.size());
+    complete_pairs = pairs;
     pairs.resize(std::max(size_t{12}, pairs.size() * 7 / 10));
     Eigen::Matrix3d h = Eigen::Matrix3d::Zero();
     Point g = Point::Zero();
@@ -362,6 +373,34 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
   if (rmse > cfg_.max_registration_rmse || (estimate.xy - initial.xy).norm() > cfg_.association_m ||
       std::abs(angle(estimate.yaw - initial.yaw)) > 0.65) {
     return false;
+  }
+  const auto spread = [](const Points& points) {
+    Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+    for (const auto& p : points) mean += p.head<2>();
+    mean /= points.size();
+    Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+    for (const auto& p : points) {
+      const Eigen::Vector2d delta = p.head<2>() - mean;
+      covariance += delta * delta.transpose();
+    }
+    covariance /= points.size();
+    return Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(covariance).eigenvalues().minCoeff();
+  };
+  Points support_geometry;
+  for (const auto& pair : complete_pairs) support_geometry.push_back(pair.p);
+  // A wall can match one visible chassis edge with tiny residual. Require
+  // horizontal shape evidence in two directions, independent of wall angle.
+  if (spread(support_geometry) <
+      cfg_.min_support_spread_ratio *
+          std::max(spread(reference_body_), cfg_.body_voxel * cfg_.body_voxel))
+    return false;
+  if (supported) {
+    supported->clear();
+    for (const auto& pair : complete_pairs) {
+      if (pair.squared <= cfg_.max_registration_rmse * cfg_.max_registration_rmse)
+        supported->push_back(pair.map);
+    }
+    if (supported->size() < 12) return false;
   }
   output = estimate;
   return true;
@@ -564,6 +603,10 @@ void Tracker::rebuild(double stamp) {
   // never counts as a new opening observation, and it is removed by the reset
   // deadline.
   if (!body.empty()) {
+    // Preserve learned rigid geometry through partial visibility. New frames
+    // contain only unique, close registration support after acquisition.
+    if (identified_ || motion_seeded_)
+      body.insert(body.end(), reference_body_.begin(), reference_body_.end());
     reference_body_ = voxelize(body, cfg_.body_voxel, cfg_.max_body_points);
   }
   accumulated_ = voxelize(upper, cfg_.opening_voxel, cfg_.max_model_points);
@@ -675,9 +718,13 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     tracked.max_x = tracked.max_y = -tracked.min_x;
     for (const auto& p : filtered) {
       const Point local = predicted.local(p);
+      const Point last_local = pose_.local(p);
+      const auto inside = [&](const Point& v) {
+        return (v.head<2>().array() >= lo.array() - margin).all() &&
+               (v.head<2>().array() <= hi.array() + margin).all();
+      };
       if (p.z() < cfg_.body_min_z || p.z() > cfg_.body_max_z ||
-          (local.head<2>().array() < lo.array() - margin).any() ||
-          (local.head<2>().array() > hi.array() + margin).any()) {
+          (!inside(local) && !inside(last_local))) {
         continue;
       }
       tracked.body.push_back(p);
@@ -764,6 +811,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     return missing(stamp, "ambiguous robot clusters", result);
   }
   Pose updated;
+  Points supported_body;
   if (!have_body_) {
     pose_.xy = chosen->center;
     pose_.yaw = 0;
@@ -777,8 +825,26 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     Pose initial = pose_;
     initial.xy += body_velocity_ * elapsed;
     initial.yaw = angle(initial.yaw + yaw_rate_ * elapsed);
-    bool registered =
-        register_body(chosen->body, initial, updated, result.registration_rmse, result.overlap);
+    bool registered = register_body(chosen->body, initial, updated, result.registration_rmse,
+                                    result.overlap, &supported_body);
+    // At a wall the chassis may stop or turn abruptly. A velocity seed alone
+    // can slip one repeating chassis feature ahead of the current returns.
+    if ((initial.xy - pose_.xy).norm() > cfg_.body_voxel * .2 ||
+        std::abs(angle(initial.yaw - pose_.yaw)) > .01) {
+      Pose fitted;
+      Points support;
+      double rmse = 0, overlap = 0;
+      if (register_body(chosen->body, pose_, fitted, rmse, overlap, &support) &&
+          (!registered ||
+           rmse + cfg_.max_registration_rmse * (1 - overlap) + .0001 <
+               result.registration_rmse + cfg_.max_registration_rmse * (1 - result.overlap))) {
+        registered = true;
+        updated = fitted;
+        result.registration_rmse = rmse;
+        result.overlap = overlap;
+        supported_body = std::move(support);
+      }
+    }
     // Repeated chassis structure can trap nearest-neighbor ICP one grid period
     // away. Also try centering the two voxelized bodies before registration.
     // The centroid is only a bounded seed; never use it as the final pose.
@@ -793,13 +859,16 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       Pose alternate = initial, fitted;
       alternate.xy += correction;
       double rmse = 0, overlap = 0;
-      if (register_body(chosen->body, alternate, fitted, rmse, overlap) &&
+      Points alternate_support;
+      if (register_body(chosen->body, alternate, fitted, rmse, overlap, &alternate_support) &&
           (!registered ||
-           (rmse + .0001 < result.registration_rmse && overlap >= result.overlap - .05))) {
+           (rmse + cfg_.max_registration_rmse * (1 - overlap) + .0001 <
+            result.registration_rmse + cfg_.max_registration_rmse * (1 - result.overlap)))) {
         registered = true;
         updated = fitted;
         result.registration_rmse = rmse;
         result.overlap = overlap;
+        supported_body = std::move(alternate_support);
       }
     }
     if (!registered) {
@@ -808,6 +877,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       }
       return missing(stamp, "robot registration rejected", result);
     }
+    chosen->body = std::move(supported_body);
     if (elapsed > 0) {
       const auto v = (updated.xy - pose_.xy) / elapsed;
       body_velocity_ = 0.5 * body_velocity_ + 0.5 * v;
@@ -819,11 +889,20 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   body_stamp_ = stamp;
   cluster_center_ = chosen->center;
   result.body_valid = true;
+  selected_ = chosen->body;
+  Point lo = Point::Constant(std::numeric_limits<double>::infinity()), hi = -lo;
+  const auto& footprint = reference_body_.empty() ? chosen->body : reference_body_;
+  for (const auto& p : footprint) {
+    const Point local = reference_body_.empty() ? pose_.local(p) : p;
+    lo = lo.cwiseMin(local);
+    hi = hi.cwiseMax(local);
+  }
   for (const auto& p : filtered) {
-    if (p.x() >= chosen->min_x - cfg_.crop_margin && p.x() <= chosen->max_x + cfg_.crop_margin &&
-        p.y() >= chosen->min_y - cfg_.crop_margin && p.y() <= chosen->max_y + cfg_.crop_margin) {
+    if (p.z() >= cfg_.body_min_z && p.z() <= cfg_.body_max_z) continue;
+    const Point local = pose_.local(p);
+    if ((local.head<2>().array() >= lo.head<2>().array() - cfg_.crop_margin).all() &&
+        (local.head<2>().array() <= hi.head<2>().array() + cfg_.crop_margin).all())
       selected_.push_back(p);
-    }
   }
   Points upper;
   for (const auto& p : selected_) {

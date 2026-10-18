@@ -18,7 +18,7 @@
   },
   "registration": {
     "correspondence_m": 0.15, "max_registration_rmse": 0.05,
-    "min_overlap": 0.5, "icp_iterations": 20
+    "min_overlap": 0.5, "min_support_spread_ratio": 0.1, "icp_iterations": 20
   },
   "opening": {
     "min_opening_z": 1.2, "max_opening_z": 2.1,
