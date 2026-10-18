@@ -19,9 +19,11 @@ def replay_static_tf(context):
 
 def generate_launch_description():
     share = get_package_share_directory('lidar_perception_system')
+    config_home = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    saved = os.path.join(config_home, 'lidar_perception_system', 'bucket_opening.json')
+    config = saved if os.path.isfile(saved) else os.path.join(share, 'config', 'bucket_opening.json')
     return LaunchDescription([
-        DeclareLaunchArgument('config_file', default_value=os.path.join(
-            share, 'config', 'bucket_opening.json')),
+        DeclareLaunchArgument('config_file', default_value=config),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('bag_path', default_value=''),
         OpaqueFunction(function=replay_static_tf),

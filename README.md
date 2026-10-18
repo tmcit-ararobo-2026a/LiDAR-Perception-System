@@ -130,11 +130,15 @@ source install/setup.bash
 cp src/LiDAR-Perception-System/config/bucket_opening.json /tmp/bucket_opening.json
 ```
 
-`/tmp/bucket_opening.json`の`opponent_roi`を、RViz上の`map`座標で相手を探索するXY矩形へ変更します。配布テンプレートの`null`は意図的な未設定値で、そのままでは検出ノードは起動エラーになります。次は書式例であり、実フィールドの設定値ではありません。
+`/tmp/bucket_opening.json`の`opponent_roi`を、RViz上の`map`座標で相手を探索するXY矩形へ変更します。配布テンプレートの`null`は意図的な未設定値で、保存済みの有効な設定も指定設定もない場合は、起動前にエラーで停止します。次は書式例であり、実フィールドの設定値ではありません。
 
 ```json
 "opponent_roi": {"min_x": -2.0, "max_x": 2.0, "min_y": 1.0, "max_y": 5.0}
 ```
+
+設定済みJSONを`~/.config/lidar_perception_system/bucket_opening.json`へ保存すると、`config_file`引数を省略してもその設定を読みます。`XDG_CONFIG_HOME`が設定されていれば、その配下の`lidar_perception_system/bucket_opening.json`を使います。明示した`config_file`が最優先です。保存設定がなければ配布テンプレートを使い、ROI未設定や不正JSONはノード起動前にエラーとして停止します。起動ログに選択した設定パスを出します。
+
+検出ノードが異常終了した場合は、同じlaunchのguardやRVizも終了させます。空のRVizだけが残って検出しているように見える状態を避けます。自己位置推定を再計算するbag再生では`--clock`を付け、`/livox/lidar /livox/imu`だけを再生し、準備区間からTFとモデルを作ってください。
 
 LiDAR入力と点群時刻のTFがある状態で起動します。
 
