@@ -206,7 +206,7 @@ JSONの`bottom`で次を設定できます。
 | --- | --- |
 | `/bucket_opening_tracker/bottom` | `BucketBottom`：底面中心・法線・半径・面残差・蓄積／最新／側面の支持点数・valid・観測stamp。開口の照準点ではない |
 | `/bucket_opening_tracker/bottom_cloud` | 確定した底面の支持点（map座標）、未確定時は空 |
-| `/bucket_opening_tracker/bottom_markers` | 底面円（橙色）、未確定・失効時は削除 |
+| `/bucket_opening_tracker/bottom_markers` | 底面円・中心球（橙色）と中心からのXYZ軸（赤・緑・青）、未確定・失効時はすべて削除 |
 | `/bucket_opening_tracker/target_raw` | 監視前の`MovingBucketTrack` |
 | `/bucket_opening_tracker/target` | 独立CPU監視後の開口中心・水平速度・不確かさ・valid |
 | `/bucket_opening_tracker/selected_cloud` | 選択した相手領域の最新3次元点群（map座標） |
@@ -215,10 +215,13 @@ JSONの`bottom`で次を設定できます。
 | `/bucket_opening_tracker/robot_markers` | 相手局所座標の軸 |
 | `/bucket_opening_tracker/diagnostics` | 処理件数・候補数・ICPの残差／対応率・蓄積点数・開口仮説の各段階・処理時間 |
 | `map → lps_opponent_<id>` | 車体姿勢を観測できた時刻の局所座標TF |
+| `map → bucket_bottom` | 確定した底面中心の動的TF。底面を観測した時刻だけ配信 |
 
 `DIRECT`は最新点にも裏付けられた開口推定、`PREDICTED`は新しい開口観測のない短期予測です。支持部からの固定高さ出力はしません。新方式の`support_points`は最新フレームで開口円を支持した点数です。開口の緑／青マーカーは監視後の結果から作り、無効時は削除します。点群と座標軸は検出過程の可視化で、有効な照準結果とは区別してください。
 
-対象TFは既定で無効です。JSONの`publish_tf`を有効にすると、新方式のguardは`map → bucket_opening`を直接観測時だけ配信します。旧方式の`moving_bucket`とは別名です。guardの`child_frame`パラメータの既定値は従来どおり`moving_bucket`です。
+底面TF `bucket_bottom`は底面の確定時に自動配信します。原点は底面中心、Z軸は底面の上向き法線、X軸は相手局所座標のX方向を底面へ投影した方向、Y軸は右手系です。円形の底面自体からyawを測定したものではありません。親は`target_frame`（既定`map`）、stampは`BucketBottom.header.stamp`と一致します。未確定・失効時は配信を止めます。TFの過去データは受信側のbufferに残るため、利用時は`/bucket_opening_tracker/bottom`の`valid`と観測時刻も確認してください。
+
+開口TFは既定で無効です。JSONの`publish_tf`を有効にすると、新方式のguardは`map → bucket_opening`を直接観測時だけ配信します。この設定は底面TFには影響しません。旧方式の`moving_bucket`とは別名です。guardの`child_frame`パラメータの既定値は従来どおり`moving_bucket`です。
 
 ### bagでの比較
 

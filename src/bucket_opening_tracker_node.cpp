@@ -459,11 +459,28 @@ class BucketOpeningTracker : public rclcpp::Node {
     visualization_msgs::msg::MarkerArray markers;
     auto ring = base_marker(header, 0, Marker::LINE_STRIP, "bucket_bottom");
     ring.action = Marker::DELETE;
+    auto center_marker = base_marker(header, 1, Marker::SPHERE, "bucket_bottom");
+    center_marker.action = Marker::DELETE;
+    std::array<Marker, 3> axes;
+    for (int axis = 0; axis < 3; ++axis) {
+      axes[axis] = base_marker(header, axis + 2, Marker::ARROW, "bucket_bottom");
+      axes[axis].action = Marker::DELETE;
+    }
     op::Points plane;
     if (t.valid) {
       const auto& b = *r.bottom;
       const auto center = r.pose.world(b.center);
-      const op::Point normal = r.pose.world(b.normal) - r.pose.world(op::Point::Zero());
+      const op::Point normal =
+          (r.pose.world(b.normal) - r.pose.world(op::Point::Zero())).normalized();
+      // A circular bottom has no observable yaw. Use the robot's local X direction
+      // projected onto the measured plane to define a consistent tangent axis.
+      op::Point x_axis(std::cos(r.pose.yaw), std::sin(r.pose.yaw), 0);
+      x_axis = (x_axis - normal * normal.dot(x_axis)).normalized();
+      Eigen::Matrix3d basis;
+      basis.col(0) = x_axis;
+      basis.col(1) = normal.cross(x_axis);
+      basis.col(2) = normal;
+      const Eigen::Quaterniond orientation(basis);
       t.last_observation_stamp = header.stamp;
       t.center = point(center);
       t.normal.x = normal.x();
@@ -480,6 +497,33 @@ class BucketOpeningTracker : public rclcpp::Node {
       ring.scale.x = .012;
       ring.color.r = 1;
       ring.color.g = .55;
+      center_marker.action = Marker::ADD;
+      center_marker.pose.position = t.center;
+      center_marker.scale.x = center_marker.scale.y = center_marker.scale.z = .045;
+      center_marker.color.r = 1;
+      center_marker.color.g = .55;
+      for (int axis = 0; axis < 3; ++axis) {
+        auto& marker = axes[axis];
+        marker.action = Marker::ADD;
+        marker.scale.x = .012;
+        marker.scale.y = .025;
+        marker.scale.z = .035;
+        marker.color.r = axis == 0 ? 1 : 0;
+        marker.color.g = axis == 1 ? 1 : 0;
+        marker.color.b = axis == 2 ? 1 : 0;
+        marker.points = {t.center, point(center + .18 * basis.col(axis))};
+      }
+      geometry_msgs::msg::TransformStamped tf;
+      tf.header = header;
+      tf.child_frame_id = "bucket_bottom";
+      tf.transform.translation.x = center.x();
+      tf.transform.translation.y = center.y();
+      tf.transform.translation.z = center.z();
+      tf.transform.rotation.x = orientation.x();
+      tf.transform.rotation.y = orientation.y();
+      tf.transform.rotation.z = orientation.z();
+      tf.transform.rotation.w = orientation.w();
+      broadcaster_->sendTransform(tf);
       const op::Point u = normal.unitOrthogonal(), v = normal.cross(u);
       for (int i = 0; i <= 64; ++i) {
         const double a = i * 2 * 3.141592653589793 / 64;
@@ -494,6 +538,8 @@ class BucketOpeningTracker : public rclcpp::Node {
       ++bottom_observed_;
     }
     markers.markers.push_back(ring);
+    markers.markers.push_back(center_marker);
+    markers.markers.insert(markers.markers.end(), axes.begin(), axes.end());
     bottom_markers_->publish(markers);
     bottom_cloud_->publish(make_cloud(plane, header));
     bottom_output_ = t;
