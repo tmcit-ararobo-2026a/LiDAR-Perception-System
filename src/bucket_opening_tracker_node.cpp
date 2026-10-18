@@ -668,15 +668,13 @@ class BucketOpeningTracker : public rclcpp::Node {
     }
     geometry_msgs::msg::TransformStamped tf;
     tf.header = header;
-    tf.child_frame_id = "lps_opponent_" + std::to_string(r.track_id);
+    tf.child_frame_id = "lps_base_link";
     tf.transform.translation.x = r.pose.xy.x();
     tf.transform.translation.y = r.pose.xy.y();
     tf.transform.rotation.z = std::sin(r.pose.yaw / 2);
     tf.transform.rotation.w = std::cos(r.pose.yaw / 2);
     if (fresh) {
-      auto base = tf;
-      base.child_frame_id = "lps_base_link";
-      broadcaster_->sendTransform(std::vector<geometry_msgs::msg::TransformStamped>{tf, base});
+      broadcaster_->sendTransform(tf);
     }
     if (!robot_markers_->get_subscription_count()) {
       return;

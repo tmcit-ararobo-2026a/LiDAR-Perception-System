@@ -100,7 +100,7 @@ Visualization Manager:
       Color: 255; 140; 0
       Decay Time: 0.3
     - Class: rviz_default_plugins/TF
-      Enabled: true
+      Enabled: false
       Name: TF (optional)
       Show Arrows: true
       Show Axes: true
@@ -118,7 +118,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Target Frame: lps_base_link
+      Target Frame: map
       Distance: 13
       Focal Point:
         X: 0

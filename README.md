@@ -217,11 +217,12 @@ JSONの`bottom`で次を設定できます。
 | `/bucket_opening_tracker/markers` | 監視後の開口円・中心・速度・状態 |
 | `/bucket_opening_tracker/robot_markers` | 相手局所座標の軸 |
 | `/bucket_opening_tracker/diagnostics` | 処理件数・候補数・ICPの残差／対応率・蓄積点数・開口仮説の各段階・処理時間 |
-| `map → lps_base_link` | 現在選択中の相手車体の固定名TF。ID付きTFと同じ時刻・位置・姿勢 |
-| `map → lps_opponent_<id>` | 車体姿勢を観測できた時刻のID付き局所座標TF |
+| `map → lps_base_link` | 現在選択中の相手車体の固定名TF。車体姿勢を観測できた時刻だけ更新 |
 | `map → bucket_bottom` | bottom_trackの底面中心の動的TF。新しい車体姿勢に同期して認識／追跡が有効なとき配信 |
 
-RVizのOrbitビューは`Target Frame: lps_base_link`で相手に追従します。既存RVizでもTarget Frameへこの名前を指定できます。これは学習モデルの2次元座標（原点は初期クラスタの基準位置、Z=0）で、相手実機の機械的なbase_linkへの較正値ではありません。TFは新しい車体姿勢を得た時刻だけ更新します。追跡失敗・不正入力・TF欠落時は`selected_cloud`と`accumulated_cloud`へ空点群を送り、入力やROS時計が停止した場合もsteady時計で既定0.3秒以内に空点群を送ります。付属RVizの車体・底面点群は`Decay Time: 0.3`とし、点群の配信自体が停止しても古い表示を残しません。RViz側のDecayはROS時計に依存するため、時計停止中の描画更新は別途確認が必要です。
+RVizのOrbitビューは`Target Frame: map`でフィールドに固定します。相手追従を使いたい場合だけ`lps_base_link`へ変更してください。標準では全TF表示を無効にし、車体と底面の軸マーカーを表示します。車体TFは`lps_base_link`に一本化し、以前の`lps_opponent_<id>`は配信しません。古いID別TFが残っている場合はRVizを再起動してください。
+
+`lps_base_link`は学習モデルの2次元座標（原点は初期クラスタの基準位置、Z=0）で、相手実機の機械的なbase_linkへの較正値ではありません。TFは新しい車体姿勢を得た時刻だけ更新します。追跡失敗・不正入力・TF欠落時は`selected_cloud`と`accumulated_cloud`へ空点群を送り、入力やROS時計が停止した場合もsteady時計で既定0.3秒以内に空点群を送ります。付属RVizの車体・底面点群は`Decay Time: 0.3`とし、点群の配信自体が停止しても古い表示を残しません。RViz側のDecayはROS時計に依存するため、時計停止中の描画更新は別途確認が必要です。
 
 `DIRECT`は最新点にも裏付けられた開口推定、`PREDICTED`は新しい開口観測のない短期予測です。支持部からの固定高さ出力はしません。新方式の`support_points`は最新フレームで開口円を支持した点数です。開口の緑／青マーカーは監視後の結果から作り、無効時は削除します。点群と座標軸は検出過程の可視化で、有効な照準結果とは区別してください。
 
