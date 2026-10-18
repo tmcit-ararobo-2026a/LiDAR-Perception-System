@@ -100,6 +100,8 @@ op::Config read_config(const nlohmann::json& j) {
   READ(tracking, reset_s);
   READ(tracking, association_m);
   READ(tracking, body_recovery_s);
+  READ(tracking, reidentification_s);
+  READ(tracking, reidentification_m);
 #undef READ
   const auto bottom = j.value("bottom", nlohmann::json::object());
 #define READ_BOTTOM(field) c.bottom.field = bottom.value(#field, c.bottom.field)
@@ -392,6 +394,7 @@ class BucketOpeningTracker : public rclcpp::Node {
       const double stamp = rclcpp::Time(item.cloud->header.stamp).seconds();
       last_result_ = tracker_->process(points, stamp, {t.x, t.y});
       body_frames_ += last_result_.body_valid;
+      reidentified_frames_ += last_result_.body_reidentified;
       radius_frames_ += last_result_.fit.radius_hypotheses > 0;
       geometry_frames_ += last_result_.fit.geometry_hypotheses > 0;
       edge_frames_ += last_result_.fit.edge_hypotheses > 0;
@@ -516,10 +519,18 @@ class BucketOpeningTracker : public rclcpp::Node {
     // publishing that frame as fresh. Later body inference must not inherit a
     // timestamp from another track or from an earlier published observation.
     if (r.bottom_tracking_observation_stamp > 0 && r.bottom_tracking_observation_stamp == r.stamp) {
-      bottom_tracking_stamp_ = header.stamp;
+      bottom_tracking_stamps_[r.track_id] = header.stamp;
+      while (bottom_tracking_stamps_.size() > 64)
+        bottom_tracking_stamps_.erase(bottom_tracking_stamps_.begin());
     }
+    // Reidentification restores an old track ID, possibly after another body
+    // was observed. Keep its exact source timestamp separate from other IDs.
+    const auto known_stamp = bottom_tracking_stamps_.find(r.track_id);
+    const auto geometry_stamp = known_stamp == bottom_tracking_stamps_.end()
+                                    ? builtin_interfaces::msg::Time()
+                                    : known_stamp->second;
     auto t =
-        bottom_message(r, header, r.tracked_bottom, r.bottom_tracking_mode, bottom_tracking_stamp_);
+        bottom_message(r, header, r.tracked_bottom, r.bottom_tracking_mode, geometry_stamp);
     visualization_msgs::msg::MarkerArray markers;
     auto ring = base_marker(header, 0, Marker::LINE_STRIP, "bucket_bottom");
     ring.action = Marker::DELETE;
@@ -744,9 +755,11 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("registration_overlap", last_result_.overlap);
     add("height_resets", tracker_->height_resets());
     add("body_registered_frames", body_frames_);
+    add("body_reidentified_frames", reidentified_frames_);
     add("robot_valid", body_debug_valid_);
     add("robot_recovered", last_result_.body_recovered);
     add("robot_upper_assisted", last_result_.body_upper_assisted);
+    add("robot_reidentified", last_result_.body_reidentified);
     add("robot_upper_model_points", tracker_->upper_body_model_points());
     add("recovery_attempts", last_result_.recovery_attempts);
     add("robot_has_motion_evidence", last_result_.motion_seeded);
@@ -793,14 +806,15 @@ class BucketOpeningTracker : public rclcpp::Node {
   std::map<std::string, Eigen::Vector3d> exclusions_;
   uint64_t received_{0}, processed_{0}, observed_{0}, predicted_{0}, tf_drops_{0}, queue_drops_{0},
       errors_{0}, duplicates_{0}, rewinds_{0};
-  uint64_t body_frames_{0}, radius_frames_{0}, geometry_frames_{0}, edge_frames_{0},
-      fresh_rim_frames_{0};
+  uint64_t body_frames_{0}, reidentified_frames_{0}, radius_frames_{0}, geometry_frames_{0},
+      edge_frames_{0}, fresh_rim_frames_{0};
   std::unique_ptr<tf2_ros::Buffer> buffer_;
   std::unique_ptr<tf2_ros::TransformListener> listener_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> broadcaster_;
   rclcpp::Publisher<Track>::SharedPtr raw_;
   rclcpp::Publisher<BottomTrack>::SharedPtr bottom_, bottom_track_;
-  builtin_interfaces::msg::Time bottom_direct_stamp_, bottom_tracking_stamp_;
+  builtin_interfaces::msg::Time bottom_direct_stamp_;
+  std::map<unsigned int, builtin_interfaces::msg::Time> bottom_tracking_stamps_;
   BottomTrack bottom_output_;
   bool body_debug_valid_{false};
   std_msgs::msg::Header body_debug_header_;

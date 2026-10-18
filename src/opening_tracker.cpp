@@ -143,6 +143,8 @@ void Config::validate() const {
                    prediction_s,
                    reset_s,
                    body_recovery_s,
+                   reidentification_s,
+                   reidentification_m,
                    association_m}) {
     if (!std::isfinite(v)) {
       throw std::invalid_argument("Opening config must be finite");
@@ -185,6 +187,8 @@ void Config::validate() const {
       min_arc <= 0 || min_arc > 2 * pi || height_change_m <= 0 || min_lip_width < 0 ||
       min_lip_width > max_residual || window_s <= 0 || window_s > 5 || prediction_s <= 0 ||
       prediction_s > reset_s || reset_s > 10 || body_recovery_s < 0 || body_recovery_s > reset_s ||
+      reidentification_s < 0 || reidentification_s > 30 || reidentification_m <= 0 ||
+      reidentification_m > 10 ||
       correspondence_m <= 0 || correspondence_m > 1 || max_registration_rmse <= 0 ||
       min_overlap <= 0 || min_overlap > 1 || association_m <= 0 || icp_iterations < 1 ||
       icp_iterations > 100 || ransac_iterations < 1 || ransac_iterations > 1000 ||
@@ -198,6 +202,7 @@ void Config::validate() const {
 Tracker::Tracker(Config config) : cfg_(config) { cfg_.validate(); }
 void Tracker::reset() {
   clear_model();
+  lost_model_.reset();
   acquisition_.reset();
 }
 void Tracker::clear_model() {
@@ -704,6 +709,96 @@ void Tracker::rebuild(double stamp) {
               upper.end());
   accumulated_ = voxelize(upper, cfg_.opening_voxel, cfg_.max_model_points);
 }
+std::optional<Tracker::Reidentification> Tracker::reidentify(
+    const std::vector<Cluster>& candidates, double stamp) {
+  if (!lost_model_) return {};
+  auto& lost = *lost_model_;
+  if (stamp < lost.body_stamp || stamp - lost.body_stamp > cfg_.reidentification_s ||
+      (cfg_.bottom.max_body_inference_s > 0 &&
+       stamp - lost.bottom_stamp > cfg_.bottom.max_body_inference_s)) {
+    lost_model_.reset();
+    return {};
+  }
+  // Search the dormant template at most twice a second. A pending match is
+  // checked on each scan; no dormant pose or semantic anchor is published.
+  if (!lost.hits && stamp - lost.attempt_stamp < .5) return {};
+  lost.attempt_stamp = stamp;
+  Tracker probe(cfg_);
+  probe.reference_body_ = lost.body;
+  Point center = Point::Zero();
+  Eigen::Vector2d model_lo = lost.body.front().head<2>(), model_hi = model_lo;
+  for (const auto& p : lost.body) {
+    center += p;
+    model_lo = model_lo.cwiseMin(p.head<2>());
+    model_hi = model_hi.cwiseMax(p.head<2>());
+  }
+  center /= lost.body.size();
+  const auto required_support =
+      std::max({size_t{40}, static_cast<size_t>(cfg_.min_body_points), lost.body.size() / 8});
+  std::vector<const Cluster*> ranked;
+  for (const auto& c : candidates)
+    if ((c.center - lost.pose.world(center).head<2>()).norm() <= cfg_.reidentification_m)
+      ranked.push_back(&c);
+  std::sort(ranked.begin(), ranked.end(), [&](const Cluster* a, const Cluster* b) {
+    return (a->center - lost.pose.world(center).head<2>()).squaredNorm() <
+           (b->center - lost.pose.world(center).head<2>()).squaredNorm();
+  });
+  std::optional<Reidentification> best;
+  double score = std::numeric_limits<double>::infinity();
+  bool ambiguous = false;
+  for (size_t i = 0; i < std::min(size_t{3}, ranked.size()); ++i) {
+    const auto& c = *ranked[i];
+    if (c.body.size() < required_support) continue;
+    std::vector<double> headings;
+    if (lost.hits) headings.push_back(lost.pending_pose.yaw);
+    // A dormant model is not extrapolated using stale velocity. Search yaw
+    // around a cluster centroid, then verify the actual rigid correspondences.
+    if (!lost.hits)
+      for (int k = 0; k < 24; ++k) headings.push_back(lost.pose.yaw + k * pi / 12);
+    for (double heading : headings) {
+      Pose seed, fitted;
+      seed.yaw = angle(heading);
+      seed.xy = c.center - seed.world(center).head<2>();
+      Points support;
+      double rmse = 0, overlap = 0;
+      if (!probe.register_body(c.body, seed, fitted, rmse, overlap, &support) ||
+          !body_size_valid(support) || overlap < std::max(.60, cfg_.min_overlap) ||
+          support.size() < required_support ||
+          (fitted.xy - lost.pose.xy).norm() > cfg_.reidentification_m)
+        continue;
+      Eigen::Vector2d lo = fitted.local(support.front()).head<2>(), hi = lo;
+      for (const auto& p : support) {
+        const auto q = fitted.local(p).head<2>().eval();
+        lo = lo.cwiseMin(q);
+        hi = hi.cwiseMax(q);
+      }
+      if (((hi - lo).array() < .5 * (model_hi - model_lo).array()).any()) continue;
+      const double coverage = static_cast<double>(support.size()) / lost.body.size();
+      const double quality = rmse + cfg_.max_registration_rmse * (2 - overlap - coverage);
+      const bool different = best && ((best->pose.xy - fitted.xy).norm() > .15 ||
+                                      std::abs(angle(best->pose.yaw - fitted.yaw)) > .25);
+      if (different && std::abs(quality - score) < .005) ambiguous = true;
+      if (quality < score) {
+        if (quality + .005 < score) ambiguous = false;
+        best = Reidentification{c, fitted, rmse, overlap};
+        best->cluster.body = std::move(support);
+        score = quality;
+      }
+    }
+  }
+  if (!best || ambiguous) {
+    lost.hits = 0;
+    return {};
+  }
+  const bool consistent = lost.hits && stamp - lost.pending_stamp <= cfg_.prediction_s &&
+                          (best->pose.xy - lost.pending_pose.xy).norm() < cfg_.association_m &&
+                          std::abs(angle(best->pose.yaw - lost.pending_pose.yaw)) < .4;
+  lost.hits = consistent ? lost.hits + 1 : 1;
+  lost.pending_pose = best->pose;
+  lost.pending_stamp = stamp;
+  if (lost.hits < std::max(3, cfg_.confirm_hits)) return {};
+  return best;
+}
 Result Tracker::missing(double stamp, const std::string& reason, Result result) {
   result.stamp = stamp;
   result.track_id = track_id_;
@@ -765,6 +860,11 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     // reset interval after the model times out.
     const bool reject =
         unconfirmed_timeout && !height_pending_ && stamp - body_stamp_ <= cfg_.prediction_s;
+    if (identified_ && learned_bottom_ && cfg_.reidentification_s > cfg_.reset_s &&
+        !reference_body_.empty()) {
+      lost_model_ = LostModel{reference_body_, pose_, *learned_bottom_, body_stamp_,
+                             learned_bottom_stamp_, -1, -1, track_id_, 0, Pose{}};
+    }
     clear_model();
     if (reject) {
       rejected_center_ = rejected;
@@ -789,6 +889,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     if (accepted(p) && accepted_index++ % stride == 0) filtered.push_back(p);
   }
   auto candidates = clusters(filtered);
+  auto reidentified = reidentify(candidates, stamp);
   const double elapsed = have_body_ ? stamp - body_stamp_ : 0;
   std::vector<lidar_perception_system::SupportCandidate> hypotheses;
   for (const auto& c : candidates) {
@@ -929,18 +1030,35 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       }
     }
   }
+  if (reidentified) chosen = &reidentified->cluster;
   if (!chosen) {
     if (!confirmed_) {
       hits_ = 0;
     }
     return missing(stamp, "no robot cluster", result);
   }
-  if (!have_body_ && ((eligible > 1 && best_evidence == 0) || second > best - 0.5)) {
+  if (!reidentified && !have_body_ &&
+      ((eligible > 1 && best_evidence == 0) || second > best - 0.5)) {
     return missing(stamp, "ambiguous robot clusters", result);
   }
   Pose updated;
   Points supported_body;
-  if (!have_body_) {
+  if (reidentified) {
+    const auto recovered = *lost_model_;
+    clear_model();
+    input_stamp_ = stamp;
+    reference_body_ = recovered.body;
+    learned_bottom_ = recovered.bottom;
+    learned_bottom_stamp_ = recovered.bottom_stamp;
+    pose_ = updated = reidentified->pose;
+    have_body_ = identified_ = true;
+    acquired_stamp_ = stamp;
+    track_id_ = recovered.id;
+    result.registration_rmse = reidentified->rmse;
+    result.overlap = reidentified->overlap;
+    result.body_reidentified = true;
+    lost_model_.reset();
+  } else if (!have_body_) {
     pose_.xy = chosen->center;
     pose_.yaw = 0;
     updated = pose_;

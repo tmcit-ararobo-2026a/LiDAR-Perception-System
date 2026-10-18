@@ -54,6 +54,7 @@ struct Config {
   int min_rim_points{12}, min_current_points{4}, min_side_points{8};
   int ransac_iterations{80}, confirm_hits{3};
   double prediction_s{0.3}, reset_s{2.0}, association_m{0.65}, body_recovery_s{2.0};
+  double reidentification_s{15.0}, reidentification_m{3.0};
   BottomConfig bottom;
   bool inside_field(const Point& p) const;
   void validate() const;
@@ -89,6 +90,7 @@ struct Result {
   bool valid{false}, predicted{false}, body_valid{false};
   bool body_recovered{false};
   bool body_upper_assisted{false};
+  bool body_reidentified{false};
   int recovery_attempts{0};
   bool motion_seeded{false};
   bool bottom_valid{false};
@@ -133,10 +135,25 @@ class Tracker {
     double stamp;
     Points body, upper;
   };
+  struct LostModel {
+    Points body;
+    Pose pose;
+    Bottom bottom;
+    double body_stamp, bottom_stamp, attempt_stamp{-1}, pending_stamp{-1};
+    unsigned int id;
+    int hits{0};
+    Pose pending_pose;
+  };
+  struct Reidentification {
+    Cluster cluster;
+    Pose pose;
+    double rmse, overlap;
+  };
   std::vector<Cluster> clusters(const Points& points) const;
   bool body_size_valid(const Points& points) const;
   bool register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
                      double& overlap, Points* supported = nullptr, bool use_upper = false) const;
+  std::optional<Reidentification> reidentify(const std::vector<Cluster>& candidates, double stamp);
   Result missing(double stamp, const std::string& reason, Result result = Result{});
   void clear_model();
   void rebuild(double stamp);
@@ -157,6 +174,7 @@ class Tracker {
   std::optional<Opening> last_opening_;
   std::optional<Bottom> last_bottom_;
   std::optional<Bottom> learned_bottom_;
+  std::optional<LostModel> lost_model_;
   double learned_bottom_stamp_{0};
   int bottom_hits_{0};
   double bottom_stamp_{0};
