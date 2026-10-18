@@ -180,14 +180,27 @@ def main():
                                 '--start-offset', str(args.offset - args.warmup_seconds),
                                 '--disable-keyboard-controls', '--topics', *replay_topics])
         start = time.monotonic()
-        while (time.monotonic() - start < args.seconds + args.warmup_seconds
+        # Reader startup and DDS discovery consume wall time without advancing
+        # the bag. End at the requested measurement interval, not a wall timer.
+        while (node.get_clock().now().nanoseconds < evaluation_end_ns
                and player.poll() is None):
             rclpy.spin_once(node, timeout_sec=.01)
+            if time.monotonic() - start > args.seconds + args.warmup_seconds + 20:
+                raise RuntimeError('Replay clock did not reach the evaluation end')
             for name, process in children:
                 if name != 'bag' and process.poll() is not None:
                     raise RuntimeError(f'{name} exited ({process.returncode}); see {run_dir}')
+        evaluation_completed = node.get_clock().now().nanoseconds >= evaluation_end_ns
+        stop(player)
+        # Admit results still in flight at the boundary; their measurement
+        # stamps, rather than callback arrival time, determine inclusion.
+        spin(max(.3, config.get('tf_wait_s', .2) + .1), check_processes=False)
+        for name, process in children:
+            if name != 'bag' and process.poll() is not None:
+                raise RuntimeError(f'{name} exited ({process.returncode}); see {run_dir}')
         report = {'offset_s': args.offset, 'elapsed_wall_s': time.monotonic() - start,
                   'evaluation_duration_s': args.seconds, 'warmup_s': args.warmup_seconds,
+                  'evaluation_completed': evaluation_completed,
                   'tf_source': 'recomputed' if args.recompute_localization else 'recorded',
                   'input_topic': config['input_topic'],
                   'diagnostics_scope': 'Lifetime snapshots, including warmup; not frame totals.',
@@ -213,6 +226,8 @@ def main():
         if (cloud_count[0] == 0 or not streams['opening']['raw']
                 or int(diagnostic.get('opening', {}).get('processed', '0')) == 0):
             raise RuntimeError('No input or opening processing results; inspect the logs')
+        if not evaluation_completed:
+            raise RuntimeError('The recording ended before the requested evaluation interval')
     finally:
         for _, process in reversed(children):
             stop(process)

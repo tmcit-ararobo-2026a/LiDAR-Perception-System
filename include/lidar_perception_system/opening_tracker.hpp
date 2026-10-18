@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "lidar_perception_system/support_candidates.hpp"
+
 namespace lidar_perception_system::opening {
 using Point = Eigen::Vector3d;
 using Points = std::vector<Point>;
@@ -54,6 +56,7 @@ struct FitStats {
 
 struct Result {
   bool valid{false}, predicted{false}, body_valid{false};
+  bool motion_seeded{false};
   unsigned int track_id{0};
   double stamp{0}, observation_stamp{0}, confidence{0}, position_variance{1};
   Point position{0, 0, 0}, velocity{0, 0, 0};
@@ -93,8 +96,10 @@ class Tracker {
   bool register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
                      double& overlap) const;
   Result missing(double stamp, const std::string& reason, Result result = Result{});
+  void clear_model();
   void rebuild(double stamp);
   Config cfg_;
+  lidar_perception_system::SupportTracker acquisition_;
   std::vector<Eigen::Vector3d> exclusions_;
   std::deque<Frame> frames_;
   Points selected_, accumulated_, reference_body_;
@@ -103,7 +108,8 @@ class Tracker {
   double yaw_rate_{0}, body_stamp_{0}, input_stamp_{-1};
   double acquired_stamp_{0}, rejection_until_{0};
   std::optional<Eigen::Vector2d> rejected_center_;
-  bool have_body_{false}, identified_{false}, confirmed_{false}, height_pending_{false};
+  bool have_body_{false}, identified_{false}, motion_seeded_{false}, confirmed_{false},
+      height_pending_{false};
   int hits_{0};
   unsigned int next_id_{0}, track_id_{0}, height_resets_{0};
   std::optional<Opening> last_opening_;

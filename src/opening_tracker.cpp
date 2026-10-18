@@ -157,12 +157,17 @@ void Config::validate() const {
 }
 Tracker::Tracker(Config config) : cfg_(config) { cfg_.validate(); }
 void Tracker::reset() {
+  clear_model();
+  acquisition_.reset();
+}
+void Tracker::clear_model() {
   frames_.clear();
   selected_.clear();
   accumulated_.clear();
   reference_body_.clear();
   have_body_ = false;
   identified_ = false;
+  motion_seeded_ = false;
   confirmed_ = false;
   height_pending_ = false;
   hits_ = 0;
@@ -177,7 +182,10 @@ void Tracker::reset() {
   velocity_.setZero();
   yaw_rate_ = 0;
 }
-void Tracker::set_exclusions(const std::vector<Eigen::Vector3d>& masks) { exclusions_ = masks; }
+void Tracker::set_exclusions(const std::vector<Eigen::Vector3d>& masks) {
+  exclusions_ = masks;
+  acquisition_.set_exclusions(masks);
+}
 
 std::vector<Tracker::Cluster> Tracker::clusters(const Points& points) const {
   std::unordered_map<Key, Points, Hash> cells;
@@ -534,6 +542,7 @@ Result Tracker::missing(double stamp, const std::string& reason, Result result) 
   result.stamp = stamp;
   result.track_id = track_id_;
   result.pose = pose_;
+  result.motion_seeded = motion_seeded_;
   result.reason = reason;
   result.observation_stamp = observation_stamp_;
   result.model_points = static_cast<int>(accumulated_.size());
@@ -574,14 +583,14 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   }
   input_stamp_ = stamp;
   const bool unconfirmed_timeout =
-      have_body_ && !identified_ && stamp - acquired_stamp_ > cfg_.reset_s;
+      have_body_ && !identified_ && !motion_seeded_ && stamp - acquired_stamp_ > cfg_.reset_s;
   // Retain an identified robot while its body is still observed, even if the
   // opening is occluded. Its expired opening remains invalid; body registration
   // never renews the opening observation stamp or its prediction allowance.
   if (have_body_ && (stamp - body_stamp_ > cfg_.reset_s || unconfirmed_timeout)) {
     const auto rejected = cluster_center_;
     const bool reject = unconfirmed_timeout && !height_pending_;
-    reset();
+    clear_model();
     if (reject) {
       rejected_center_ = rejected;
       rejection_until_ = stamp + cfg_.reset_s;
@@ -604,8 +613,16 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     filtered.push_back(p);
   }
   auto candidates = clusters(filtered);
-  result.candidates = static_cast<int>(candidates.size());
   const double elapsed = have_body_ ? stamp - body_stamp_ : 0;
+  std::vector<lidar_perception_system::SupportCandidate> hypotheses;
+  for (const auto& c : candidates) {
+    hypotheses.push_back({c.center, static_cast<unsigned int>(c.body.size()), 0});
+  }
+  const std::optional<Eigen::Vector2d> acquisition_hint =
+      have_body_ ? std::optional<Eigen::Vector2d>(cluster_center_ + body_velocity_ * elapsed)
+                 : std::nullopt;
+  const auto motion_hint = acquisition_.observe_candidates(hypotheses, stamp, acquisition_hint);
+  result.candidates = static_cast<int>(candidates.size());
   if (have_body_ && !reference_body_.empty()) {
     // Sparse scans can split a robot into several connected components. Once
     // acquired, collect its predicted footprint rather than following whichever
@@ -648,6 +665,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   const Eigen::Vector2d hint = cluster_center_ + body_velocity_ * elapsed;
   Cluster* chosen = nullptr;
   double best = -1e9, second = -1e9;
+  int best_evidence = -1, eligible = 0;
+  bool chosen_motion = false;
   for (auto& c : candidates) {
     if (have_body_ && (c.center - hint).norm() > cfg_.association_m + 0.5 * elapsed) {
       continue;
@@ -668,6 +687,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     if (excluded) {
       continue;
     }
+    ++eligible;
     int upper = 0;
     Points upper_context;
     for (const auto& p : filtered) {
@@ -680,16 +700,22 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
     double score =
         have_body_ ? -(c.center - hint).norm() : std::log1p(c.body.size()) + std::log1p(upper);
+    const bool moving = motion_hint && (c.center - motion_hint->xy).norm() < 0.05;
+    int evidence = 0;
     if (!have_body_) {
+      if (moving) evidence = 1;
       if (const auto opening = fit_opening(upper_context, upper_context)) {
-        score += 20 + opening->score;
+        evidence = 2;
+        score += opening->score;
       }
     }
-    if (score > best) {
-      second = best;
+    if (evidence > best_evidence || (evidence == best_evidence && score > best)) {
+      second = evidence == best_evidence ? best : -1e9;
       best = score;
+      best_evidence = evidence;
       chosen = &c;
-    } else {
+      chosen_motion = moving;
+    } else if (evidence == best_evidence) {
       second = std::max(second, score);
     }
   }
@@ -699,7 +725,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
     return missing(stamp, "no robot cluster", result);
   }
-  if (!have_body_ && second > best - 0.5) {
+  if (!have_body_ && ((eligible > 1 && best_evidence == 0) || second > best - 0.5)) {
     return missing(stamp, "ambiguous robot clusters", result);
   }
   Pose updated;
@@ -708,6 +734,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     pose_.yaw = 0;
     updated = pose_;
     have_body_ = true;
+    motion_seeded_ = chosen_motion;
     acquired_stamp_ = stamp;
     track_id_ = ++next_id_;
     result.overlap = 1;
@@ -728,6 +755,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
   }
   pose_ = updated;
+  motion_seeded_ = motion_seeded_ || chosen_motion;
   body_stamp_ = stamp;
   cluster_center_ = chosen->center;
   result.body_valid = true;

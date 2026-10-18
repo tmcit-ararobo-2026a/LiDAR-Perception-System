@@ -532,6 +532,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("registration_overlap", last_result_.overlap);
     add("height_resets", tracker_->height_resets());
     add("body_registered_frames", body_frames_);
+    add("robot_has_motion_evidence", last_result_.motion_seeded);
     add("rim_radius_frames", radius_frames_);
     add("rim_geometry_frames", geometry_frames_);
     add("rim_edge_frames", edge_frames_);
