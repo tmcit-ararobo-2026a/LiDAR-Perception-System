@@ -34,6 +34,7 @@ Key key(const Point& p, double size) {
           static_cast<int>(std::floor(p.z() / size))};
 }
 Points voxelize(const Points& input, double size, size_t limit) {
+  if (limit == 0 || input.empty()) return {};
   struct Cell {
     Point sum{0, 0, 0};
     int count{0};
@@ -114,6 +115,7 @@ void Config::validate() const {
                    self_radius,
                    body_min_z,
                    body_max_z,
+                   tracking_body_max_z,
                    cluster_resolution,
                    min_span,
                    max_span,
@@ -174,6 +176,7 @@ void Config::validate() const {
       std::max({std::abs(min_x), std::abs(max_x), std::abs(min_y), std::abs(max_y), std::abs(min_z),
                 std::abs(max_z)}) > 100 ||
       body_min_z < min_z || body_min_z >= body_max_z || body_max_z >= min_opening_z ||
+      tracking_body_max_z < body_max_z || tracking_body_max_z > max_z ||
       min_opening_z >= max_opening_z || max_opening_z > max_z || self_radius < 0 ||
       crop_margin < 0 || min_span <= 0 || max_span < min_span || cluster_resolution < 0.01 ||
       body_voxel < 0.005 || opening_voxel < 0.001 || min_radius <= 0 || min_radius >= max_radius ||
@@ -202,6 +205,7 @@ void Tracker::clear_model() {
   selected_.clear();
   accumulated_.clear();
   reference_body_.clear();
+  reference_upper_.clear();
   have_body_ = false;
   identified_ = false;
   motion_seeded_ = false;
@@ -231,6 +235,18 @@ void Tracker::set_exclusions(const std::vector<Eigen::Vector3d>& masks) {
 
 bool Tracker::body_size_valid(const Points& points) const {
   if (points.empty()) return false;
+  const size_t lower = std::count_if(points.begin(), points.end(), [&](const Point& p) {
+    return p.z() >= cfg_.body_min_z && p.z() <= cfg_.body_max_z;
+  });
+  if (lower < 3) return false;
+  Eigen::Vector2d lower_lo = Eigen::Vector2d::Constant(std::numeric_limits<double>::infinity());
+  Eigen::Vector2d lower_hi = -lower_lo;
+  for (const auto& p : points) {
+    if (p.z() < cfg_.body_min_z || p.z() > cfg_.body_max_z) continue;
+    lower_lo = lower_lo.cwiseMin(p.head<2>());
+    lower_hi = lower_hi.cwiseMax(p.head<2>());
+  }
+  if ((lower_hi - lower_lo).norm() < .10) return false;
   // Search square orientations, not map-axis widths. A legal 1.2 m square
   // spans 1.70 m in map X/Y at 45 degrees. One-degree sampling contributes
   // at most 11 mm at the default size, covered by the measurement tolerance.
@@ -240,6 +256,7 @@ bool Tracker::body_size_valid(const Points& points) const {
     Eigen::Vector2d lo = Eigen::Vector2d::Constant(std::numeric_limits<double>::infinity());
     Eigen::Vector2d hi = -lo;
     for (const auto& p : points) {
+      if (p.z() < cfg_.body_min_z || p.z() > cfg_.body_max_z) continue;
       const Eigen::Vector2d q(c * p.x() + s * p.y(), -s * p.x() + c * p.y());
       lo = lo.cwiseMin(q);
       hi = hi.cwiseMax(q);
@@ -308,14 +325,22 @@ std::vector<Tracker::Cluster> Tracker::clusters(const Points& points) const {
   return result;
 }
 
-bool Tracker::register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
-                            double& overlap, Points* supported) const {
-  if (reference_body_.empty()) {
+bool Tracker::register_body(const Points& input, const Pose& initial, Pose& output, double& rmse,
+                            double& overlap, Points* supported, bool use_upper) const {
+  Points lower, reference;
+  for (const auto& p : input)
+    if (use_upper || p.z() <= cfg_.body_max_z) lower.push_back(p);
+  for (const auto& p : reference_body_)
+    if (use_upper || p.z() <= cfg_.body_max_z) reference.push_back(p);
+  if (use_upper)
+    reference.insert(reference.end(), reference_upper_.begin(), reference_upper_.end());
+  const Points& body = lower;
+  if (reference.empty() || body.empty()) {
     return false;
   }
   std::unordered_map<Key, std::vector<size_t>, Hash> hash;
-  for (size_t i = 0; i < reference_body_.size(); ++i) {
-    hash[key(reference_body_[i], cfg_.correspondence_m)].push_back(i);
+  for (size_t i = 0; i < reference.size(); ++i) {
+    hash[key(reference[i], cfg_.correspondence_m)].push_back(i);
   }
   Pose estimate = initial;
   struct Pair {
@@ -325,7 +350,7 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
   std::vector<Pair> complete_pairs;
   for (int iteration = 0; iteration <= cfg_.icp_iterations; ++iteration) {
     // A dense wall must not vote hundreds of times for one chassis feature.
-    std::vector<std::optional<Pair>> closest(reference_body_.size());
+    std::vector<std::optional<Pair>> closest(reference.size());
     std::vector<Pair> pairs;
     for (const auto& map : body) {
       const Point p = estimate.local(map);
@@ -341,10 +366,10 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
               continue;
             }
             for (size_t i : cell->second) {
-              double d = (p - reference_body_[i]).squaredNorm();
+              double d = (p - reference[i]).squaredNorm();
               if (d < best) {
                 best = d;
-                q = &reference_body_[i];
+                q = &reference[i];
                 reference_index = i;
               }
             }
@@ -358,7 +383,7 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
     for (const auto& pair : closest)
       if (pair) pairs.push_back(*pair);
     overlap = static_cast<double>(pairs.size()) /
-              std::max(size_t{1}, std::min(body.size(), reference_body_.size()));
+              std::max(size_t{1}, std::min(body.size(), reference.size()));
     if (overlap < cfg_.min_overlap || pairs.size() < 12) {
       return false;
     }
@@ -416,7 +441,7 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
                                       }),
                        complete_pairs.end());
   overlap = static_cast<double>(complete_pairs.size()) /
-            std::max(size_t{1}, std::min(body.size(), reference_body_.size()));
+            std::max(size_t{1}, std::min(body.size(), reference.size()));
   if (complete_pairs.size() < 12 || overlap < cfg_.min_overlap) return false;
   double inlier_squared = 0;
   for (const auto& p : complete_pairs) inlier_squared += p.squared;
@@ -441,9 +466,8 @@ bool Tracker::register_body(const Points& body, const Pose& initial, Pose& outpu
   for (const auto& pair : complete_pairs) support_geometry.push_back(pair.p);
   // A wall can match one visible chassis edge with tiny residual. Require
   // horizontal shape evidence in two directions, independent of wall angle.
-  if (spread(support_geometry) <
-      cfg_.min_support_spread_ratio *
-          std::max(spread(reference_body_), cfg_.body_voxel * cfg_.body_voxel))
+  if (spread(support_geometry) < cfg_.min_support_spread_ratio *
+                                     std::max(spread(reference), cfg_.body_voxel * cfg_.body_voxel))
     return false;
   if (supported) {
     supported->clear();
@@ -661,7 +685,19 @@ void Tracker::rebuild(double stamp) {
     body.erase(std::remove_if(body.begin(), body.end(),
                               [&](const Point& p) { return !cfg_.inside_field(pose_.world(p)); }),
                body.end());
-    reference_body_ = voxelize(body, cfg_.body_voxel, cfg_.max_body_points);
+    Points lower, upper_body;
+    for (const auto& p : body) {
+      if (p.z() <= cfg_.body_max_z)
+        lower.push_back(p);
+      else if (!learned_bottom_ ||
+               (p.head<2>() - learned_bottom_->center.head<2>()).norm() >= cfg_.max_radius + .04)
+        upper_body.push_back(p);
+    }
+    reference_body_ = voxelize(lower, cfg_.body_voxel, cfg_.max_body_points);
+    reference_upper_ =
+        voxelize(upper_body, cfg_.body_voxel, std::min(500, cfg_.max_body_points / 4));
+  } else {
+    reference_upper_.clear();
   }
   upper.erase(std::remove_if(upper.begin(), upper.end(),
                              [&](const Point& p) { return !cfg_.inside_field(pose_.world(p)); }),
@@ -724,7 +760,11 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   // never renews the opening observation stamp or its prediction allowance.
   if (have_body_ && (stamp - body_stamp_ > cfg_.reset_s || unconfirmed_timeout)) {
     const auto rejected = cluster_center_;
-    const bool reject = unconfirmed_timeout && !height_pending_;
+    // A failed template after missing observations is not evidence of a fixed
+    // fixture. Do not blacklist a real opponent's last location for another
+    // reset interval after the model times out.
+    const bool reject =
+        unconfirmed_timeout && !height_pending_ && stamp - body_stamp_ <= cfg_.prediction_s;
     clear_model();
     if (reject) {
       rejected_center_ = rejected;
@@ -771,11 +811,13 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     Eigen::Vector2d lo = reference_body_.front().head<2>();
     Eigen::Vector2d hi = lo;
     for (const auto& p : reference_body_) {
+      if (p.z() > cfg_.body_max_z) continue;
       lo = lo.cwiseMin(p.head<2>());
       hi = hi.cwiseMax(p.head<2>());
     }
     const double margin = std::min(0.30, 0.10 + 0.20 * elapsed);
     Cluster tracked;
+    size_t lower_count = 0;
     tracked.center.setZero();
     tracked.min_x = tracked.min_y = std::numeric_limits<double>::infinity();
     tracked.max_x = tracked.max_y = -tracked.min_x;
@@ -786,21 +828,35 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
         return (v.head<2>().array() >= lo.array() - margin).all() &&
                (v.head<2>().array() <= hi.array() + margin).all();
       };
-      if (p.z() < cfg_.body_min_z || p.z() > cfg_.body_max_z ||
+      if (p.z() < cfg_.body_min_z || p.z() > cfg_.tracking_body_max_z ||
           (!inside(local) && !inside(last_local))) {
         continue;
       }
       tracked.body.push_back(p);
-      tracked.center += p.head<2>();
-      tracked.min_x = std::min(tracked.min_x, p.x());
-      tracked.max_x = std::max(tracked.max_x, p.x());
-      tracked.min_y = std::min(tracked.min_y, p.y());
-      tracked.max_y = std::max(tracked.max_y, p.y());
+      if (p.z() <= cfg_.body_max_z) {
+        ++lower_count;
+        tracked.center += p.head<2>();
+        tracked.min_x = std::min(tracked.min_x, p.x());
+        tracked.max_x = std::max(tracked.max_x, p.x());
+        tracked.min_y = std::min(tracked.min_y, p.y());
+        tracked.max_y = std::max(tracked.max_y, p.y());
+      }
     }
     candidates.clear();
-    if (static_cast<int>(tracked.body.size()) >= cfg_.min_body_points) {
-      tracked.center /= tracked.body.size();
-      tracked.body = voxelize(tracked.body, cfg_.body_voxel, cfg_.max_body_points);
+    if (static_cast<int>(tracked.body.size()) >= cfg_.min_body_points && lower_count >= 3 &&
+        (lower_count >= static_cast<size_t>(cfg_.min_body_points) || !reference_upper_.empty())) {
+      tracked.center /= lower_count;
+      Points lower, upper;
+      for (const auto& p : tracked.body) {
+        if (p.z() <= cfg_.body_max_z)
+          lower.push_back(p);
+        else
+          upper.push_back(p);
+      }
+      tracked.body = voxelize(lower, cfg_.body_voxel, cfg_.max_body_points);
+      auto upper_returns =
+          voxelize(upper, cfg_.body_voxel, std::min(500, cfg_.max_body_points / 4));
+      tracked.body.insert(tracked.body.end(), upper_returns.begin(), upper_returns.end());
       candidates.push_back(std::move(tracked));
     }
   }
@@ -921,10 +977,20 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     // away. Also try centering the two voxelized bodies before registration.
     // The centroid is only a bounded seed; never use it as the final pose.
     Point reference_center = Point::Zero(), observed_center = Point::Zero();
-    for (const auto& p : reference_body_) reference_center += p;
-    for (const auto& p : chosen->body) observed_center += p;
-    reference_center /= reference_body_.size();
-    observed_center /= chosen->body.size();
+    Points lower_reference;
+    size_t observed_lower = 0;
+    for (const auto& p : reference_body_)
+      if (p.z() <= cfg_.body_max_z) {
+        reference_center += p;
+        lower_reference.push_back(p);
+      }
+    for (const auto& p : chosen->body)
+      if (p.z() <= cfg_.body_max_z) {
+        observed_center += p;
+        ++observed_lower;
+      }
+    reference_center /= std::max(size_t{1}, lower_reference.size());
+    observed_center /= std::max(size_t{1}, observed_lower);
     const Eigen::Vector2d correction =
         (observed_center - initial.world(reference_center)).head<2>();
     if (correction.norm() > cfg_.body_voxel * .2 && correction.norm() < cfg_.correspondence_m) {
@@ -943,7 +1009,9 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
         supported_body = std::move(alternate_support);
       }
     }
-    if ((!registered || supported_body.size() < .7 * reference_body_.size()) &&
+    if (observed_lower < static_cast<size_t>(cfg_.min_body_points)) registered = false;
+    if ((!registered ||
+         (!result.body_upper_assisted && supported_body.size() < .7 * lower_reference.size())) &&
         elapsed <= cfg_.body_recovery_s) {
       // Never reacquire from a centroid alone: each seed must pass the same
       // unique correspondences, residual, overlap and 2D-shape checks as ICP.
@@ -955,7 +1023,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       });
       Cluster* recovered = nullptr;
       const auto quality = [&](double rmse, double overlap, size_t support) {
-        const double coverage = static_cast<double>(support) / reference_body_.size();
+        const double coverage = static_cast<double>(support) / lower_reference.size();
         return rmse + cfg_.max_registration_rmse * (2 - overlap - coverage);
       };
       bool have_solution = registered;
@@ -980,9 +1048,9 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
         const auto direction = eigen.eigenvectors().col(1);
         return std::atan2(direction.y(), direction.x());
       };
-      const auto model_heading = principal_heading(reference_body_);
-      Eigen::Vector2d model_lo = reference_body_.front().head<2>(), model_hi = model_lo;
-      for (const auto& p : reference_body_) {
+      const auto model_heading = principal_heading(lower_reference);
+      Eigen::Vector2d model_lo = lower_reference.front().head<2>(), model_hi = model_lo;
+      for (const auto& p : lower_reference) {
         model_lo = model_lo.cwiseMin(p.head<2>());
         model_hi = model_hi.cwiseMax(p.head<2>());
       }
@@ -1036,7 +1104,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
             result.overlap = overlap;
             supported_body = std::move(support);
             if (rmse < .003 && overlap > .98 &&
-                supported_body.size() > .98 * reference_body_.size())
+                supported_body.size() > .98 * lower_reference.size())
               break;
           }
         }
@@ -1045,6 +1113,50 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       if (recovered && registered) {
         chosen = recovered;
         result.body_recovered = true;
+        result.body_upper_assisted = false;
+      }
+    }
+    if (!registered && !reference_upper_.empty()) {
+      // Upper features supplement an established model only after lower-only
+      // ICP fails. Their movement must never spoil a good lower-body match.
+      std::vector<Pose> upper_seeds{initial, pose_};
+      Point observed_upper = Point::Zero(), model_upper = Point::Zero();
+      size_t upper_count = 0;
+      for (const auto& p : chosen->body)
+        if (p.z() > cfg_.body_max_z) {
+          observed_upper += p;
+          ++upper_count;
+        }
+      for (const auto& p : reference_upper_) model_upper += p;
+      if (upper_count >= 12 && !reference_upper_.empty()) {
+        observed_upper /= upper_count;
+        model_upper /= reference_upper_.size();
+        Pose centered = initial;
+        const Eigen::Vector2d correction = (observed_upper - centered.world(model_upper)).head<2>();
+        if (correction.norm() < cfg_.association_m) {
+          centered.xy += correction;
+          upper_seeds.push_back(centered);
+        }
+      }
+      for (const Pose& seed : upper_seeds) {
+        Pose fitted;
+        Points support;
+        double rmse = 0, overlap = 0;
+        if (!register_body(chosen->body, seed, fitted, rmse, overlap, &support, true) ||
+            !body_size_valid(support) ||
+            std::count_if(support.begin(), support.end(),
+                          [&](const Point& p) { return p.z() > cfg_.body_max_z; }) < 6)
+          continue;
+        if (!registered ||
+            rmse + cfg_.max_registration_rmse * (1 - overlap) <
+                result.registration_rmse + cfg_.max_registration_rmse * (1 - result.overlap)) {
+          registered = true;
+          updated = fitted;
+          result.registration_rmse = rmse;
+          result.overlap = overlap;
+          supported_body = std::move(support);
+          result.body_upper_assisted = true;
+        }
       }
     }
     if (!registered) {
@@ -1067,10 +1179,13 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   body_stamp_ = stamp;
   cluster_center_ = pose_.xy;
   result.body_valid = true;
-  selected_ = chosen->body;
+  selected_.clear();
+  for (const auto& p : chosen->body)
+    if (p.z() <= cfg_.body_max_z) selected_.push_back(p);
   Point lo = Point::Constant(std::numeric_limits<double>::infinity()), hi = -lo;
   const auto& footprint = reference_body_.empty() ? chosen->body : reference_body_;
   for (const auto& p : footprint) {
+    if (p.z() > cfg_.body_max_z) continue;
     const Point local = reference_body_.empty() ? pose_.local(p) : p;
     lo = lo.cwiseMin(local);
     hi = hi.cwiseMax(local);
@@ -1105,6 +1220,27 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   Frame frame;
   frame.stamp = stamp;
   frame.body = local_points(chosen->body, pose_);
+  // Learn upper rigid features only while the lower chassis independently
+  // supports the pose. Never grow a new upper model from upper-only alignment.
+  const auto lower_support =
+      std::count_if(chosen->body.begin(), chosen->body.end(),
+                    [&](const Point& p) { return p.z() <= cfg_.body_max_z; });
+  result.body_upper_assisted = result.body_upper_assisted || lower_support < cfg_.min_body_points;
+  if (!result.body_upper_assisted && lower_support >= cfg_.min_body_points) {
+    for (const auto& p : filtered) {
+      if (p.z() <= cfg_.body_max_z || p.z() > cfg_.tracking_body_max_z) continue;
+      const Point local = pose_.local(p);
+      if ((local.head<2>().array() < lo.head<2>().array() - .10).any() ||
+          (local.head<2>().array() > hi.head<2>().array() + .10).any())
+        continue;
+      // A learned bucket may lift independently of the chassis. Keep its
+      // neighborhood out of the rigid registration reference.
+      if (learned_bottom_ &&
+          (local.head<2>() - learned_bottom_->center.head<2>()).norm() < cfg_.max_radius + .04)
+        continue;
+      frame.body.push_back(local);
+    }
+  }
   frame.upper = upper;
   frames_.push_back(std::move(frame));
   // At most 100 accepted scans per second; protect memory under pathological

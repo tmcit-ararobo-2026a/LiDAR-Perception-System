@@ -9,7 +9,7 @@
     "max_frame_points": 50000
   },
   "robot": {
-    "body_min_z": 0.15, "body_max_z": 1.0,
+    "body_min_z": 0.15, "body_max_z": 1.0, "tracking_body_max_z": 1.8,
     "cluster_resolution": 0.1, "min_span": 0.2, "max_span": 1.85,
     "max_body_side": 1.2, "body_size_tolerance": 0.05,
     "crop_margin": 0.3, "min_body_points": 20
@@ -49,7 +49,7 @@
   },
   "tracking": {
     "confirm_hits": 3, "max_prediction_s": 0.3,
-    "reset_s": 2.0, "association_m": 0.65, "body_recovery_s": 0.6
+    "reset_s": 2.0, "association_m": 0.65, "body_recovery_s": 2.0
   },
   "tf_wait_s": 0.2,
   "queue_size": 4,

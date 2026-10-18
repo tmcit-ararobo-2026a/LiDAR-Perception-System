@@ -38,6 +38,7 @@ struct Config {
   double field_min_x{-5.25}, field_max_x{5.25}, field_min_y{-5.70}, field_max_y{5.70};
   double min_z{0.10}, max_z{2.20}, self_radius{0.8};
   double body_min_z{0.15}, body_max_z{1.0}, cluster_resolution{0.10};
+  double tracking_body_max_z{1.8};
   double min_span{0.20}, max_span{1.85}, crop_margin{0.30};
   double max_body_side{1.20}, body_size_tolerance{0.05};
   int min_body_points{20};
@@ -52,7 +53,7 @@ struct Config {
   double min_arc{2.09439510239}, height_change_m{0.03}, min_lip_width{0.003};
   int min_rim_points{12}, min_current_points{4}, min_side_points{8};
   int ransac_iterations{80}, confirm_hits{3};
-  double prediction_s{0.3}, reset_s{2.0}, association_m{0.65}, body_recovery_s{0.6};
+  double prediction_s{0.3}, reset_s{2.0}, association_m{0.65}, body_recovery_s{2.0};
   BottomConfig bottom;
   bool inside_field(const Point& p) const;
   void validate() const;
@@ -87,6 +88,7 @@ struct FitStats {
 struct Result {
   bool valid{false}, predicted{false}, body_valid{false};
   bool body_recovered{false};
+  bool body_upper_assisted{false};
   int recovery_attempts{0};
   bool motion_seeded{false};
   bool bottom_valid{false};
@@ -116,6 +118,7 @@ class Tracker {
   const Points& selected_cloud() const { return selected_; }
   const Points& accumulated_cloud() const { return accumulated_; }
   const Points& body_model() const { return reference_body_; }
+  size_t upper_body_model_points() const { return reference_upper_.size(); }
   unsigned int height_resets() const { return height_resets_; }
   std::optional<Opening> fit_opening(const Points& accumulated, const Points& current,
                                      FitStats* stats = nullptr) const;
@@ -133,7 +136,7 @@ class Tracker {
   std::vector<Cluster> clusters(const Points& points) const;
   bool body_size_valid(const Points& points) const;
   bool register_body(const Points& body, const Pose& initial, Pose& output, double& rmse,
-                     double& overlap, Points* supported = nullptr) const;
+                     double& overlap, Points* supported = nullptr, bool use_upper = false) const;
   Result missing(double stamp, const std::string& reason, Result result = Result{});
   void clear_model();
   void rebuild(double stamp);
@@ -141,7 +144,7 @@ class Tracker {
   lidar_perception_system::SupportTracker acquisition_;
   std::vector<Eigen::Vector3d> exclusions_;
   std::deque<Frame> frames_;
-  Points selected_, accumulated_, reference_body_;
+  Points selected_, accumulated_, reference_body_, reference_upper_;
   Pose pose_;
   Eigen::Vector2d body_velocity_{0, 0}, cluster_center_{0, 0};
   double yaw_rate_{0}, body_stamp_{0}, input_stamp_{-1};

@@ -63,6 +63,7 @@ op::Config read_config(const nlohmann::json& j) {
   READ(filter, max_frame_points);
   READ(robot, body_min_z);
   READ(robot, body_max_z);
+  READ(robot, tracking_body_max_z);
   READ(robot, cluster_resolution);
   READ(robot, min_span);
   READ(robot, max_span);
@@ -745,6 +746,8 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("body_registered_frames", body_frames_);
     add("robot_valid", body_debug_valid_);
     add("robot_recovered", last_result_.body_recovered);
+    add("robot_upper_assisted", last_result_.body_upper_assisted);
+    add("robot_upper_model_points", tracker_->upper_body_model_points());
     add("recovery_attempts", last_result_.recovery_attempts);
     add("robot_has_motion_evidence", last_result_.motion_seeded);
     add("bottom_observed_frames", bottom_observed_);
