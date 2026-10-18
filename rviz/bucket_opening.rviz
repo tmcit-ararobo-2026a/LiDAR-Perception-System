@@ -71,7 +71,7 @@ Visualization Manager:
       Color: 255; 180; 70
       Decay Time: 0.3
     - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
+      Enabled: false
       Name: Opponent Frame
       Topic:
         Value: /bucket_opening_tracker/robot_markers
@@ -81,6 +81,9 @@ Visualization Manager:
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Bucket Bottom (observed)
+      Namespaces:
+        bucket_bottom: true
+        bucket_bottom_axes: false
       Topic:
         Value: /bucket_opening_tracker/bottom_markers
         Reliability Policy: Reliable
@@ -100,8 +103,10 @@ Visualization Manager:
       Color: 255; 140; 0
       Decay Time: 0.3
     - Class: rviz_default_plugins/TF
-      Enabled: false
+      Enabled: true
       Name: TF (optional)
+      Frames:
+        All Enabled: true
       Show Arrows: true
       Show Axes: true
       Show Names: false

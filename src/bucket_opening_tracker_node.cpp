@@ -518,7 +518,7 @@ class BucketOpeningTracker : public rclcpp::Node {
     center_marker.action = Marker::DELETE;
     std::array<Marker, 3> axes;
     for (int axis = 0; axis < 3; ++axis) {
-      axes[axis] = base_marker(header, axis + 2, Marker::ARROW, "bucket_bottom");
+      axes[axis] = base_marker(header, axis + 2, Marker::ARROW, "bucket_bottom_axes");
       axes[axis].action = Marker::DELETE;
     }
     op::Points plane;
