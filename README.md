@@ -132,6 +132,8 @@ ros2 launch lidar_perception_system bucket_opening_rviz.launch.py use_sim_time:=
 
 起動に使う設定はGit管理の[config/bucket_opening.json](config/bucket_opening.json)です。設定済みの`opponent_roi`とともにパッケージへインストールするため、別PCでも同じブランチを取得してビルドすれば、JSONの手動コピーや`config_file`指定なしで起動できます。Gitから設定を更新した後も、再ビルドして`source install/setup.bash`を実行してください。実時間で動かす場合は`use_sim_time:=true`を省略します。
 
+既存PCを更新する場合は、上のビルド前に`git -C ~/ros2_ws/src/LiDAR-Perception-System pull --ff-only`で同じブランチの変更を取得します。起動ログが古いinstall内のJSONを指し、`opponent_roi needs finite ... bounds`で停止する場合も、更新後の再ビルドとsetupのsourceを確認してください。
+
 既定の入力は自己位置推定が出力する`/dynamic_cloud`、座標系は`map`です。`opponent_roi`はX=-5.5〜5.5m、Y=0.2〜5.7mで、後述の`field_bounds`との共通範囲を探索します。別の地図・原点・フィールドを使う場合は、`opponent_roi`をその`map`座標での探索矩形に合わせてください。
 
 両launchとも既定でパッケージ同梱JSONを読み、`~/.config`や`XDG_CONFIG_HOME`の保存設定は自動選択しません。個別の設定を使う場合は同梱JSONをコピー・編集し、`config_file:=/absolute/path/to/config.json`で明示します。ROI未設定や不正JSONはノード起動前にエラーとして停止し、正常時は選択した設定パスをログへ出します。
@@ -223,7 +225,7 @@ SHAPE_FITTEDは円錐台に適合した現在の側面からXYを補正できま
 
 既存RVizを使う場合はMarkerArray表示を追加して`/bucket_opening_tracker/bottom_markers`を選びます。別途`bucket_opening.launch.py`で新ノードを起動する必要があります。最初の形状認識前、車体登録失敗、底面観測の期限超過、入力停止時には底面markerを削除します。
 
-比較画像の「横位置」は画像用に原点を移した相対座標で、mapのX/Y座標そのものではありません。画像上の横位置をそのままRVizの座標へ指定しないでください。設定ファイルは再起動後も残る場所へ保存してください。`input_topic`を`/dynamic_cloud`にする場合は、そのpublisherが自己位置推定から配信されていることも確認します。
+比較画像の「横位置」は画像用に原点を移した相対座標で、mapのX/Y座標そのものではありません。画像上の横位置をそのままRVizの座標へ指定しないでください。既定の設定はGit管理の同梱JSONを使います。個別設定を明示する場合は、再起動後も残る場所へ保存してください。既定の入力`/dynamic_cloud`のpublisherが自己位置推定から配信されていることも確認します。
 
 ### 出力とRViz
 
@@ -265,7 +267,7 @@ ros2 run lidar_perception_system benchmark_opening.py /absolute/path/to/bag --co
 
 旧CUDA方式と同じ入力で比較する場合は、`--baseline-executable /absolute/path/to/moving_bucket_detector`を追加します。必要なら`--baseline-config`も指定します。CPUのみのinstallには旧GPU実行ファイルがないため、比較には別途ビルド済みの実行ファイルが必要です。
 
-自己位置推定を再実行する場合は、`gn10_pointcloud_localization`をビルド・sourceした環境で`--recompute-localization`を付けます。スクリプトが`localization.launch.py use_sim_time:=true`を起動し、bagの`/livox/lidar /livox/imu`だけを再生します。記録済みTFは流しません。このモードではJSONの`input_topic`を`/dynamic_cloud`へ変更して、静的地図との差分点群から相手の局所モデルを作る比較もできます。ここでの差分は地図との幾何的な不一致であり、停止中の相手も含みます。自己位置推定の誤差や地図上の固定物との近接による点の除去には注意が必要です。
+自己位置推定を再実行する場合は、`gn10_pointcloud_localization`をビルド・sourceした環境で`--recompute-localization`を付けます。スクリプトが`localization.launch.py use_sim_time:=true`を起動し、bagの`/livox/lidar /livox/imu`だけを再生します。記録済みTFは流しません。このモードでは同梱JSONの既定入力`/dynamic_cloud`を使い、静的地図との差分点群から相手の局所モデルを作れます。前述の記録済みTF用JSONを使い回す場合は、`input_topic`を`/dynamic_cloud`へ戻してください。ここでの差分は地図との幾何的な不一致であり、停止中の相手も含みます。自己位置推定の誤差や地図上の固定物との近接による点の除去には注意が必要です。
 
 試合前からモデルを蓄積するには`--warmup-seconds`を指定します。例えば`--offset 936 --warmup-seconds 36 --seconds 180 --recompute-localization`は900秒から再生し、936秒から180秒間の計測だけを件数に集計します。準備区間と試合区間で追跡状態をリセットしません。診断のカウンタ・ピークは準備区間も含む生存期間のスナップショットなので、試合中の件数とは区別してください。記録に存在しないセッティング区間の点群は復元できません。
 
