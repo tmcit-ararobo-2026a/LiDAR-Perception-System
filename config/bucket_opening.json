@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "input_topic": "/livox/lidar",
+  "input_topic": "/dynamic_cloud",
   "target_frame": "map",
-  "opponent_roi": null,
+  "opponent_roi": {"min_x": -5.5, "max_x": 5.5, "min_y": 0.2, "max_y": 5.7},
   "field_bounds": {"min_x": -5.25, "max_x": 5.25, "min_y": -5.7, "max_y": 5.7},
   "filter": {
     "min_z": 0.1, "max_z": 2.2, "self_radius": 0.8,
@@ -54,8 +54,8 @@
     "reset_s": 2.0, "association_m": 0.65, "body_recovery_s": 2.0,
     "reidentification_s": 15.0, "reidentification_m": 3.0
   },
-  "tf_wait_s": 0.2,
-  "queue_size": 4,
+  "tf_wait_s": 0.9,
+  "queue_size": 12,
   "max_input_bytes": 8388608,
   "publish_tf": false
 }

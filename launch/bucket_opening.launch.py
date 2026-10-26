@@ -27,8 +27,8 @@ def check_config(context):
     except (OSError, ValueError, TypeError) as error:
         raise RuntimeError(
             f'Invalid bucket config {path}: {error}. '
-            'Set config_file:=/absolute/path/to/config.json, or save a configured JSON at '
-            '~/.config/lidar_perception_system/bucket_opening.json.') from error
+            'Fix config/bucket_opening.json and rebuild the package, or set '
+            'config_file:=/absolute/path/to/config.json.') from error
     return [LogInfo(msg=f'Bucket detection config: {path}')]
 
 
@@ -42,10 +42,6 @@ def tracker_exited(event, context):
 def generate_launch_description():
     config = os.path.join(get_package_share_directory('lidar_perception_system'),
                           'config', 'bucket_opening.json')
-    config_home = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
-    saved = os.path.join(config_home, 'lidar_perception_system', 'bucket_opening.json')
-    if os.path.isfile(saved):
-        config = saved
     common = {'config_file': LaunchConfiguration('config_file'),
               'use_sim_time': LaunchConfiguration('use_sim_time')}
     tracker = Node(package='lidar_perception_system', executable='bucket_opening_tracker',

@@ -127,26 +127,24 @@ cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
 colcon build --packages-select lidar_perception_system --cmake-args -DBUILD_GPU_NODES=OFF
 source install/setup.bash
-cp src/LiDAR-Perception-System/config/bucket_opening.json /tmp/bucket_opening.json
+ros2 launch lidar_perception_system bucket_opening_rviz.launch.py use_sim_time:=true
 ```
 
-`/tmp/bucket_opening.json`の`opponent_roi`を、RViz上の`map`座標で相手を探索するXY矩形へ変更します。配布テンプレートの`null`は意図的な未設定値で、保存済みの有効な設定も指定設定もない場合は、起動前にエラーで停止します。次は書式例であり、実フィールドの設定値ではありません。
+起動に使う設定はGit管理の[config/bucket_opening.json](config/bucket_opening.json)です。設定済みの`opponent_roi`とともにパッケージへインストールするため、別PCでも同じブランチを取得してビルドすれば、JSONの手動コピーや`config_file`指定なしで起動できます。Gitから設定を更新した後も、再ビルドして`source install/setup.bash`を実行してください。実時間で動かす場合は`use_sim_time:=true`を省略します。
 
-```json
-"opponent_roi": {"min_x": -2.0, "max_x": 2.0, "min_y": 1.0, "max_y": 5.0}
-```
+既定の入力は自己位置推定が出力する`/dynamic_cloud`、座標系は`map`です。`opponent_roi`はX=-5.5〜5.5m、Y=0.2〜5.7mで、後述の`field_bounds`との共通範囲を探索します。別の地図・原点・フィールドを使う場合は、`opponent_roi`をその`map`座標での探索矩形に合わせてください。
 
-設定済みJSONを`~/.config/lidar_perception_system/bucket_opening.json`へ保存すると、`config_file`引数を省略してもその設定を読みます。`XDG_CONFIG_HOME`が設定されていれば、その配下の`lidar_perception_system/bucket_opening.json`を使います。明示した`config_file`が最優先です。保存設定がなければ配布テンプレートを使い、ROI未設定や不正JSONはノード起動前にエラーとして停止します。起動ログに選択した設定パスを出します。
+両launchとも既定でパッケージ同梱JSONを読み、`~/.config`や`XDG_CONFIG_HOME`の保存設定は自動選択しません。個別の設定を使う場合は同梱JSONをコピー・編集し、`config_file:=/absolute/path/to/config.json`で明示します。ROI未設定や不正JSONはノード起動前にエラーとして停止し、正常時は選択した設定パスをログへ出します。
 
 検出ノードが異常終了した場合は、同じlaunchのguardやRVizも終了させます。空のRVizだけが残って検出しているように見える状態を避けます。自己位置推定を再計算するbag再生では`--clock`を付け、`/livox/lidar /livox/imu`だけを再生し、準備区間からTFとモデルを作ってください。
 
-LiDAR入力と点群時刻のTFがある状態で起動します。
+自己位置推定からの`/dynamic_cloud`入力と点群時刻のTFがある状態で起動します。
 
 ```bash
-ros2 launch lidar_perception_system bucket_opening_rviz.launch.py config_file:=/tmp/bucket_opening.json
+ros2 launch lidar_perception_system bucket_opening_rviz.launch.py
 ```
 
-RVizなしでは`bucket_opening.launch.py`を使います。bag途中再生の例は次のとおりです。`bag_path`は固定TFを事前配信するための引数です。動的TFはbagの記録値を使う例なので、自己位置推定による同じTFの再計算とは同時に行いません。
+RVizなしでは`bucket_opening.launch.py`を使います。bag途中再生の例は次のとおりです。この例では同梱JSONを`/tmp/bucket_opening.json`へコピーし、`input_topic`を`/livox/lidar`へ変更します。`bag_path`は固定TFを事前配信するための引数です。動的TFはbagの記録値を使う例なので、自己位置推定による同じTFの再計算とは同時に行いません。
 
 ```bash
 ros2 launch lidar_perception_system bucket_opening_rviz.launch.py config_file:=/tmp/bucket_opening.json use_sim_time:=true bag_path:=/absolute/path/to/bag
