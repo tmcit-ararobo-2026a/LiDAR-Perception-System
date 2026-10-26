@@ -8,6 +8,7 @@
 #include <cmath>
 #include <deque>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace lidar_perception_system
@@ -34,7 +35,15 @@ public:
     const std::vector<GridCell> & grid, const GridConfig & cfg, double stamp,
     const std::optional<Eigen::Vector2d> & hint = std::nullopt)
   {
-    auto candidates = components(grid, cfg);
+    return observe_candidates(components(grid, cfg), stamp, hint);
+  }
+
+  // Candidate extraction can also be supplied by a CPU point-cloud clusterer.
+  // Keep the same association and motion evidence as the existing grid path.
+  std::optional<SupportCandidate> observe_candidates(
+    std::vector<SupportCandidate> candidates, double stamp,
+    const std::optional<Eigen::Vector2d> & hint = std::nullopt)
+  {
     candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
       [this, &hint](const auto & candidate) {
         // A locked moving target may pass close to a fixed fixture. Only its

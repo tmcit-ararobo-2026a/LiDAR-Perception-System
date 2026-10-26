@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "input_topic": "/dynamic_cloud",
+  "target_frame": "map",
+  "opponent_roi": {"min_x": -5.5, "max_x": 5.5, "min_y": 0.2, "max_y": 5.7},
+  "field_bounds": {"min_x": -5.25, "max_x": 5.25, "min_y": -5.7, "max_y": 5.7},
+  "filter": {
+    "min_z": 0.1, "max_z": 2.2, "self_radius": 0.8,
+    "max_frame_points": 50000
+  },
+  "robot": {
+    "body_min_z": 0.15, "body_max_z": 1.0, "tracking_body_max_z": 1.8,
+    "cluster_resolution": 0.1, "min_span": 0.2, "max_span": 1.85,
+    "max_body_side": 1.2, "body_size_tolerance": 0.05,
+    "crop_margin": 0.3, "min_body_points": 20
+  },
+  "accumulation": {
+    "window_s": 1.0, "body_voxel": 0.03, "opening_voxel": 0.01,
+    "max_body_points": 2000, "max_model_points": 20000
+  },
+  "registration": {
+    "correspondence_m": 0.15, "max_registration_rmse": 0.05,
+    "min_overlap": 0.5, "min_support_spread_ratio": 0.1, "icp_iterations": 20
+  },
+  "opening": {
+    "min_opening_z": 1.2, "max_opening_z": 2.1,
+    "min_radius": 0.11, "max_radius": 0.15, "nominal_radius": 0.1365,
+    "slice_m": 0.02, "min_arc": 2.09439510239,
+    "max_residual": 0.015, "max_plane_rmse": 0.004,
+    "min_lip_width": 0.003, "height_change_m": 0.03,
+    "min_rim_points": 12, "min_current_points": 4, "min_side_points": 8,
+    "ransac_iterations": 80
+  },
+  "bottom": {
+    "sparse_shape_enabled": true,
+    "shape_tracking_min_points": 3,
+    "bucket_height": 0.255,
+    "height_tolerance": 0.035,
+    "min_radius": 0.075,
+    "max_radius": 0.135,
+    "plane_distance": 0.012,
+    "max_plane_rmse": 0.008,
+    "max_tilt_rad": 0.1745329252,
+    "connection_m": 0.035,
+    "side_tolerance": 0.03,
+    "min_side_span": 0.12,
+    "max_body_inference_s": 0.0,
+    "min_plane_points": 20,
+    "min_current_points": 4,
+    "min_side_points": 6
+  },
+  "tracking": {
+    "confirm_hits": 3, "max_prediction_s": 0.3,
+    "reset_s": 2.0, "association_m": 0.65, "body_recovery_s": 2.0,
+    "reidentification_s": 15.0, "reidentification_m": 3.0
+  },
+  "tf_wait_s": 0.9,
+  "queue_size": 12,
+  "max_input_bytes": 8388608,
+  "publish_tf": false
+}
