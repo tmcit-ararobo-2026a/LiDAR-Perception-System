@@ -194,7 +194,9 @@ JSONの`filter`・`robot`・`accumulation`・`registration`・`opening`・`botto
 
 高さごとの点群を連結成分に分け、ほぼ水平でコンパクトな円盤状の面を検出します。面の内部にも支持点を要求し、円弧だけの側面や大きい天板から任意に切り出した円を拒否します。さらに、その上へ続く側面の半径・高さ方向の広がりを確認し、想定したバケツ高さを越えて側面が続く構造や、内部を貫く太い支柱を除外します。複数の同程度の候補があれば確定しません。
 
-最新scanでも底面の支持点を要求し、`tracking.confirm_hits`回の位置・高さの一致で`bottom.valid=true`にします。車体や過去の蓄積だけで底面を有効にし続けません。観測欠落時は無効、入力停止時はROS時計とsteady時計の監視により既定0.3秒で無効にします。時計停止・巻き戻し・不正点群・TF欠落でも古い有効結果を維持しません。高さ変化時は上部モデルを破棄して再確認します。開口中心を底面高さと定数から生成することはありません。
+通常の密な平面認識（DIRECT）は最新scanでも底面の支持点を要求します。疎な点群には、底面平面と側面の円錐台形状を組み合わせる経路（SHAPE_FITTED）を追加しています。底面平面は蓄積中に最低`max(6, min_plane_points/3)`点、側面は最低`max(10, min_side_points)`点・120度以上の円弧・バケツ高さの65%以上の観測幅を要求します。側面の65%以上が半径モデルに一致することを確認し、内部を埋める点・上方へ続く構造・大きな天板の一部・同程度に合う複数候補を拒否します。最新scanにも最低`min_current_points`点の形状支持（うち側面2点以上）を要求するため、過去の底面だけで初期認識しません。
+
+`tracking.confirm_hits`回の位置・高さの一致で`bottom.valid=true`にします。疎な形状候補は既定0.3秒以内の短い欠測を挟んで確認できますが、未確定の間は底面を出力しません。車体や過去の蓄積だけで新しい底面を認識した扱いにはしません。観測欠落時は無効、入力停止時はROS時計とsteady時計の監視により既定0.3秒で無効にします。時計停止・巻き戻し・不正点群・TF欠落でも古い有効結果を維持しません。高さ変化時は上部モデルを破棄して再確認します。開口中心を底面高さと定数から生成することはありません。
 
 JSONの`bottom`で次を設定できます。
 
@@ -206,16 +208,20 @@ JSONの`bottom`で次を設定できます。
 | `max_tilt_rad` | 約0.175rad | 平面法線の傾き上限 |
 | `connection_m` | 0.035m | 平面候補の連結距離 |
 | `side_tolerance` / `min_side_span` | 0.030 / 0.12m | 側面半径の許容誤差と観測高さ幅 |
-| `min_plane_points` | 20 | 蓄積面の最低支持点数 |
-| `min_current_points` | 4 | 最新scanの最低面支持点数 |
-| `min_side_points` | 6 | 上側側面の最低支持点数 |
+| `min_plane_points` | 20 | DIRECTの蓄積面の最低支持点数。SHAPE_FITTEDの面下限は上記の別条件 |
+| `min_current_points` | 4 | DIRECT/PLANE_TRACKEDでは最新面、SHAPE_FITTEDでは最新形状の最低支持点数 |
+| `min_side_points` | 6 | 上側側面の最低支持点数。SHAPE_FITTEDでは最低10点 |
+| `sparse_shape_enabled` | true | 疎な平面＋円錐台認識と、既知形状の側面追跡を使用する |
+| `shape_tracking_min_points` | 3 | 認識済み形状の側面追跡に必要な最新支持点。3点時は残差を半分に制限 |
 | `max_body_inference_s` | 0 | 0は同じ車体を観測できる間、取付点モデルを保持。正値なら面欠測時の補完上限（最大10秒） |
+
+SHAPE_FITTEDは円錐台に適合した現在の側面からXYを補正できます。側面だけの更新では、学習済みの面高さ・法線・半径を保持し、高さを新しく実測した扱いにはしません。局所補正は`crop_margin`・`association_m`の範囲内で最大30cmまで探索します。10cmを超す補正には最新側面6点以上・120度以上の円弧・高さ65%以上の広がりを追加で要求し、同程度の異なる位置があれば棄却します。モード値は4、confidenceは最大0.5（最新3点だけなら最大0.25）です。`current_points`は現在の形状支持数であり、底面の現在支持点数とは限りません。`bottom_cloud`は実際に観測された面の点だけなので、側面だけの更新では空になることがあります。車体からの補完（BODY_INFERRED）は引き続きconfidence=0で、形状観測stampも延長しません。
 
 探索する底面高さは、開口の許容高さからバケツ高さを引いて導出します。取付位置の探索範囲は相手ROIと`robot.crop_margin`にも依存します。底面・側面が完全に隠れる、透明材から十分な反射が返らない、同形状の物体と区別できない場合は未確定です。ルールの共通バケツを対象とする方式であり、任意の形状・遮蔽・機体に対する成功保証ではありません。別の実ロボットでの検出率は未受入です。
 
 ### 旧マーカーから新しい底面表示へ切り替える
 
-`/moving_bucket_detector/markers`は従来方式の出力です。`moving_bucket.launch.py`や`moving_bucket_rviz.launch.py`で新しい底面検出は起動しません。底面の表示は`bucket_opening_rviz.launch.py`を起動し、`/bucket_opening_tracker/bottom_markers`（認識は橙、面追跡は黄、車体からの補完は水色）と`/bucket_opening_tracker/bottom_cloud`を確認してください。RVizのFixed Frameは`map`です。`/bucket_opening_tracker/markers`は開口の結果です。
+`/moving_bucket_detector/markers`は従来方式の出力です。`moving_bucket.launch.py`や`moving_bucket_rviz.launch.py`で新しい底面検出は起動しません。底面の表示は`bucket_opening_rviz.launch.py`を起動し、`/bucket_opening_tracker/bottom_markers`（DIRECTは橙、面追跡は黄、形状フィットは紫、車体からの補完は水色）と`/bucket_opening_tracker/bottom_cloud`を確認してください。RVizのFixed Frameは`map`です。`/bucket_opening_tracker/markers`は開口の結果です。
 
 既存RVizを使う場合はMarkerArray表示を追加して`/bucket_opening_tracker/bottom_markers`を選びます。別途`bucket_opening.launch.py`で新ノードを起動する必要があります。最初の形状認識前、車体登録失敗、底面観測の期限超過、入力停止時には底面markerを削除します。
 
@@ -225,10 +231,10 @@ JSONの`bottom`で次を設定できます。
 
 | 名前 | 内容 |
 | --- | --- |
-| `/bucket_opening_tracker/bottom` | `BucketBottom`：従来どおり、形状認識が確定した底面だけvalid（DIRECT）。開口の照準点ではない |
-| `/bucket_opening_tracker/bottom_track` | `BucketBottom`：認識済み底面の追跡結果。DIRECT／PLANE_TRACKED／BODY_INFERREDと元の面観測stampを区別 |
+| `/bucket_opening_tracker/bottom` | `BucketBottom`：形状認識が確定した底面だけvalid（DIRECT／SHAPE_FITTED）。開口の照準点ではない |
+| `/bucket_opening_tracker/bottom_track` | `BucketBottom`：認識済み底面の追跡結果。DIRECT／PLANE_TRACKED／SHAPE_FITTED／BODY_INFERREDと形状観測stampを区別 |
 | `/bucket_opening_tracker/bottom_cloud` | 現在scanの追跡面支持点（map座標）、車体からの補完・無効時は空 |
-| `/bucket_opening_tracker/bottom_markers` | 底面円・中心球（認識:橙、面追跡:黄、車体補完:水色）とXYZ軸（赤・緑・青）、無効時はすべて削除 |
+| `/bucket_opening_tracker/bottom_markers` | 底面円・中心球（DIRECT:橙、面追跡:黄、形状フィット:紫、車体補完:水色）とXYZ軸（赤・緑・青）、無効時はすべて削除 |
 | `/bucket_opening_tracker/target_raw` | 監視前の`MovingBucketTrack` |
 | `/bucket_opening_tracker/target` | 独立CPU監視後の開口中心・水平速度・不確かさ・valid |
 | `/bucket_opening_tracker/selected_cloud` | フィールド内の最新車体登録支持点と相手局所範囲の上部点群（map座標）。未追跡・失効時は空 |
@@ -247,9 +253,9 @@ RVizのOrbitビューは`Target Frame: map`でフィールドに固定します�
 
 `BucketBottom`型に`observation_mode`を追加しています。この型を使う独自のC++ノードがある場合は再ビルドし、購読ノードも再起動してください。
 
-底面を一度形状認識した後は、相手の局所座標に取付位置を保存します。毎scanで円盤全体を再認識する必要はありません。現在の底面近傍に最低4点の二次元的な広がりを持つ平面があれば、高さ・法線を補正して`PLANE_TRACKED`として追跡します。局所XYと半径は最初に認識した値を引き継ぐため、部分面だけから新しいバケツを認識した意味ではありません。面が隠れた区間は現在の車体ICP姿勢から`BODY_INFERRED`として位置を更新します。既定では同じ車体を観測できる間、学習した取付点を車体モデルの一部として保持します。`bottom.max_body_inference_s`を正値にすると、その秒数を面の最終観測から超えた時点で停止し、全体形状の再認識が必要です。車体登録の失敗・別track・観測との矛盾があるフレームでは追跡出力を無効にします。単発の別高さ候補で学習済みモデルを破棄せず、新しい底面が継続して形状認識された時点で取付位置を置き換えます。完全遮蔽中の昇降や取付位置変更は観測できず、BODY_INFERREDの底面位置には追従できません。このモードは最後に認識した取付位置が車体に対して変わらないというモデル予測です。
+底面を一度形状認識した後は、相手の局所座標に取付位置を保存します。毎scanで円盤全体を再認識する必要はありません。現在の底面近傍に最低4点の二次元的な広がりを持つ平面があれば、高さ・法線を補正して`PLANE_TRACKED`として追跡します。局所XYと半径は最初に認識した値を引き継ぐため、部分面だけから新しいバケツを認識した意味ではありません。面が隠れた区間は現在の車体ICP姿勢から`BODY_INFERRED`として位置を更新します。既定では同じ車体を観測できる間、学習した取付点を車体モデルの一部として保持します。`bottom.max_body_inference_s`を正値にすると、その秒数を面・形状の最終観測から超えた時点で停止し、全体形状の再認識が必要です。車体登録の失敗・別track・観測との矛盾があるフレームでは追跡出力を無効にします。単発の別高さ候補で学習済みモデルを破棄せず、新しい底面が継続して形状認識された時点で取付位置を置き換えます。完全遮蔽中の昇降や取付位置変更は観測できず、BODY_INFERREDの底面位置には追従できません。このモードは最後に認識した取付位置が車体に対して変わらないというモデル予測です。
 
-底面TF `bucket_bottom`は`/bucket_opening_tracker/bottom_track`の有効結果から自動配信します。原点は底面中心、Z軸は底面法線、X軸は相手局所Xを底面へ投影した方向、Y軸は右手系です。円形底面からyawを測定した意味ではありません。親は`target_frame`（既定`map`）、TFのstampは現在の追跡時刻です。`last_observation_stamp`は面を観測した時刻を保持し、車体だけの更新では延長しません。`BODY_INFERRED`のconfidenceとcurrent_pointsは0です。TFの過去履歴は受信bufferに残るため、利用側はbottom_trackのvalid・observation_mode・観測時刻も確認してください。入力やROS時計の停止時には、steady時計でも既定0.3秒で失効します。
+底面TF `bucket_bottom`は`/bucket_opening_tracker/bottom_track`の有効結果から自動配信します。原点は底面中心、Z軸は底面法線、X軸は相手局所Xを底面へ投影した方向、Y軸は右手系です。円形底面からyawを測定した意味ではありません。親は`target_frame`（既定`map`）、TFのstampは現在の追跡時刻です。`last_observation_stamp`は面または形状を観測した時刻を保持し、車体だけの更新では延長しません。SHAPE_FITTEDの側面更新ではXYが観測され、面高さは保持されます。`BODY_INFERRED`のconfidenceとcurrent_pointsは0です。TFの過去履歴は受信bufferに残るため、利用側はbottom_trackのvalid・observation_mode・観測時刻も確認してください。入力やROS時計の停止時には、steady時計でも既定0.3秒で失効します。
 
 開口TFは既定で無効です。JSONの`publish_tf`を有効にすると、新方式のguardは`map → bucket_opening`を直接観測時だけ配信します。この設定は底面TFには影響しません。旧方式の`moving_bucket`とは別名です。guardの`child_frame`パラメータの既定値は従来どおり`moving_bucket`です。
 

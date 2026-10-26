@@ -119,6 +119,8 @@ op::Config read_config(const nlohmann::json& j) {
   READ_BOTTOM(min_plane_points);
   READ_BOTTOM(min_current_points);
   READ_BOTTOM(min_side_points);
+  READ_BOTTOM(sparse_shape_enabled);
+  READ_BOTTOM(shape_tracking_min_points);
 #undef READ_BOTTOM
   c.prediction_s = tracking.value("max_prediction_s", c.prediction_s);
   c.validate();
@@ -503,16 +505,22 @@ class BucketOpeningTracker : public rclcpp::Node {
     t.confidence = mode == op::BottomMode::BodyInferred
                        ? 0
                        : std::clamp(1. - b.plane_rmse / cfg_.bottom.max_plane_rmse, 0., 1.);
+    if (mode == op::BottomMode::ShapeFitted) {
+      const double tolerance = std::min(cfg_.bottom.plane_distance, cfg_.bottom.side_tolerance * .5);
+      t.confidence = .5 * std::min(1., b.current_points / 6.) *
+                     std::clamp(1. - b.boundary_residual / tolerance, 0., 1.);
+    }
     return t;
   }
   void publish_bottom(const op::Result& r, std_msgs::msg::Header header) {
     header.frame_id = frame_;
-    auto measured = bottom_message(r, header, r.bottom,
-                                   r.bottom_valid ? op::BottomMode::Direct : op::BottomMode::None,
-                                   bottom_direct_stamp_);
+    const auto measurement_mode = !r.bottom_valid ? op::BottomMode::None
+        : (r.bottom_shape_fitted ? op::BottomMode::ShapeFitted : op::BottomMode::Direct);
+    auto measured = bottom_message(r, header, r.bottom, measurement_mode, bottom_direct_stamp_);
     if (measured.valid) {
       bottom_direct_stamp_ = measured.last_observation_stamp;
       ++bottom_observed_;
+      bottom_shape_observed_ += r.bottom_shape_fitted;
     }
     bottom_->publish(measured);
     // Retain the exact plane timestamp even when processing latency prevents
@@ -559,9 +567,10 @@ class BucketOpeningTracker : public rclcpp::Node {
       ring.action = Marker::ADD;
       ring.scale.x = .012;
       const bool inferred = t.observation_mode == BottomTrack::BODY_INFERRED;
+      const bool shape = t.observation_mode == BottomTrack::SHAPE_FITTED;
       ring.color.r = inferred ? 0 : 1;
-      ring.color.g = t.observation_mode == BottomTrack::DIRECT ? .55 : 1;
-      ring.color.b = inferred ? 1 : 0;
+      ring.color.g = shape ? .25 : (t.observation_mode == BottomTrack::DIRECT ? .55 : 1);
+      ring.color.b = inferred || shape ? 1 : 0;
       center_marker.action = Marker::ADD;
       center_marker.pose.position = t.center;
       center_marker.scale.x = center_marker.scale.y = center_marker.scale.z = .045;
@@ -764,6 +773,8 @@ class BucketOpeningTracker : public rclcpp::Node {
     add("recovery_attempts", last_result_.recovery_attempts);
     add("robot_has_motion_evidence", last_result_.motion_seeded);
     add("bottom_observed_frames", bottom_observed_);
+    add("bottom_shape_observed_frames", bottom_shape_observed_);
+    add("bottom_shape_fitted", last_result_.bottom_shape_fitted);
     add("bottom_tracking_valid", bottom_output_.valid);
     add("bottom_tracking_mode", bottom_output_.observation_mode);
     add("bottom_tracked_frames", bottom_tracked_);
@@ -820,7 +831,7 @@ class BucketOpeningTracker : public rclcpp::Node {
   std_msgs::msg::Header body_debug_header_;
   std::chrono::steady_clock::time_point body_debug_received_;
   std::chrono::steady_clock::time_point bottom_received_;
-  uint64_t bottom_observed_{0}, bottom_tracked_{0};
+  uint64_t bottom_observed_{0}, bottom_shape_observed_{0}, bottom_tracked_{0};
   rclcpp::Publisher<Cloud>::SharedPtr selected_, accumulated_, bottom_cloud_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_, robot_markers_,

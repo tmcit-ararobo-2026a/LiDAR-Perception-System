@@ -282,4 +282,399 @@ std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& c
   tracked.side_points = 0;
   return tracked;
 }
-}  // namespace lidar_perception_system::opening
+namespace {
+struct ShapeAxis {
+  Point origin, normal, x, y;
+  Point local(const Point& p) const {
+    const Point d = p - origin;
+    return {d.dot(x), d.dot(y), d.dot(normal)};
+  }
+  Point world(const XY& p) const { return origin + x * p.x() + y * p.y(); }
+};
+ShapeAxis shape_axis(const Point& origin, const Point& normal) {
+  const Point x = (Point::UnitX() - normal * normal.x()).normalized();
+  return {origin, normal, x, normal.cross(x)};
+}
+double shape_radius(double bottom_radius, double z, const Config& cfg) {
+  return bottom_radius + (cfg.nominal_radius - bottom_radius) *
+                             std::clamp(z / cfg.bottom.bucket_height, 0., 1.);
+}
+double shape_tolerance(const Config& cfg) {
+  return std::min(cfg.bottom.plane_distance, cfg.bottom.side_tolerance * .5);
+}
+struct ShapeEvidence {
+  int sides{0}, plane{0}, solid{0}, continuing{0}, shell{0};
+  double squared{0}, low{1e9}, high{-1e9}, arc{0};
+};
+ShapeEvidence shape_evidence(const Points &points, const XY &center,
+                             double radius, const Config &cfg) {
+  ShapeEvidence e;
+  std::vector<double> angles;
+  for (const auto &p : points) {
+    const XY d = p.head<2>() - center;
+    const double r = d.norm(), z = p.z();
+    if (std::abs(z) <= cfg.bottom.plane_distance &&
+        r <= radius + cfg.bottom.plane_distance)
+      ++e.plane;
+    if (z > .08 && z < cfg.bottom.bucket_height + cfg.bottom.height_tolerance &&
+        r < shape_radius(radius, z, cfg) * .75)
+      ++e.solid;
+    if (z > cfg.bottom.bucket_height + cfg.bottom.height_tolerance &&
+        z < cfg.bottom.bucket_height + .20 && r > radius * .6 &&
+        r < cfg.nominal_radius + cfg.bottom.side_tolerance)
+      ++e.continuing;
+    if (z < .035 || z > cfg.bottom.bucket_height + cfg.bottom.height_tolerance)
+      continue;
+    if (r < cfg.nominal_radius + cfg.bottom.side_tolerance)
+      ++e.shell;
+    const double error = r - shape_radius(radius, z, cfg);
+    if (std::abs(error) > shape_tolerance(cfg))
+      continue;
+    ++e.sides;
+    e.squared += error * error;
+    e.low = std::min(e.low, z);
+    e.high = std::max(e.high, z);
+    angles.push_back(std::atan2(d.y(), d.x()));
+  }
+  e.arc = span(std::move(angles));
+  return e;
+}
+std::vector<XY> shape_centers(const Point &a, const Point &b, double radius,
+                              const Config &cfg) {
+  const XY d = b.head<2>() - a.head<2>();
+  const double distance = d.norm();
+  if (distance < .06)
+    return {};
+  const double r1 = shape_radius(radius, a.z(), cfg),
+               r2 = shape_radius(radius, b.z(), cfg);
+  const double along =
+      (r1 * r1 - r2 * r2 + distance * distance) / (2 * distance);
+  const double height2 = r1 * r1 - along * along;
+  if (height2 < 0)
+    return {};
+  const XY u = d / distance, v(-u.y(), u.x());
+  const XY midpoint = a.head<2>() + u * along;
+  return {midpoint + v * std::sqrt(height2), midpoint - v * std::sqrt(height2)};
+}
+bool refine_shape(const Points &side, XY &center, double &radius,
+                  const Config &cfg, bool fit_radius) {
+  for (int iteration = 0; iteration < 8; ++iteration) {
+    Eigen::Matrix3d h = Eigen::Matrix3d::Zero();
+    Point g = Point::Zero();
+    int used = 0;
+    for (const auto &p : side) {
+      const XY d = center - p.head<2>();
+      const double norm = d.norm();
+      if (norm < 1e-6)
+        continue;
+      const double error = norm - shape_radius(radius, p.z(), cfg);
+      if (std::abs(error) > cfg.bottom.side_tolerance)
+        continue;
+      const Point j(
+          d.x() / norm, d.y() / norm,
+          fit_radius
+              ? -(1 - std::clamp(p.z() / cfg.bottom.bucket_height, 0., 1.))
+              : 0.);
+      const double weight =
+          std::min(1., shape_tolerance(cfg) / std::max(1e-9, std::abs(error)));
+      h.noalias() += weight * j * j.transpose();
+      g.noalias() += weight * j * error;
+      ++used;
+    }
+    if (used < (fit_radius ? 4 : 3))
+      return false;
+    if (!fit_radius)
+      h(2, 2) = 1;
+    if (std::abs(h.determinant()) < 1e-8)
+      return false;
+    Point step = -h.ldlt().solve(g);
+    if (!step.allFinite())
+      return false;
+    step /= std::max(1., step.norm() / .025);
+    center += step.head<2>();
+    if (fit_radius)
+      radius = std::clamp(radius + step.z(), cfg.bottom.min_radius,
+                          cfg.bottom.max_radius);
+    if (step.norm() < 1e-5)
+      break;
+  }
+  return true;
+}
+std::optional<Bottom> fit_sparse_patch(const Points &plane, const Points &all,
+                                       const Points &current,
+                                       const Config &cfg) {
+  const auto &c = cfg.bottom;
+  if (plane.size() < static_cast<size_t>(std::max(6, c.min_plane_points / 3)))
+    return {};
+  Point mean = Point::Zero();
+  for (const auto &p : plane)
+    mean += p;
+  mean /= plane.size();
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  for (const auto &p : plane)
+    covariance += (p - mean) * (p - mean).transpose();
+  covariance /= plane.size();
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(covariance);
+  if (eig.info() != Eigen::Success || eig.eigenvalues()[1] < .0002)
+    return {};
+  Point normal = eig.eigenvectors().col(0);
+  if (normal.z() < 0)
+    normal = -normal;
+  const double plane_rmse = std::sqrt(std::max(0., eig.eigenvalues()[0]));
+  if (normal.z() < std::cos(c.max_tilt_rad) || plane_rmse > c.max_plane_rmse)
+    return {};
+  const auto axis = shape_axis(mean, normal);
+  Points floor, context, fresh, side;
+  XY lo = XY::Constant(1e9), hi = -lo;
+  // A quantized height slice can leave a few noisy disk points while excluding
+  // a coplanar large deck. Grow the entire component on the fitted plane
+  // before evaluating its footprint; never carve a disk from that deck.
+  Points coplanar, component;
+  for (const auto &p : all)
+    if (std::abs(normal.dot(p - mean)) <= c.plane_distance)
+      coplanar.push_back(p);
+  for (auto &group :
+       patches(coplanar, std::max(c.connection_m, c.min_radius))) {
+    if (std::any_of(group.begin(), group.end(), [&](const Point &p) {
+          return (p - plane.front()).squaredNorm() < 1e-12;
+        })) {
+      component = std::move(group);
+      break;
+    }
+  }
+  if (component.empty())
+    return {};
+  double plane_squared = 0;
+  for (const auto &p : component) {
+    const auto q = axis.local(p);
+    floor.push_back(q);
+    lo = lo.cwiseMin(q.head<2>());
+    hi = hi.cwiseMax(q.head<2>());
+    plane_squared += q.z() * q.z();
+  }
+  const double supported_plane_rmse =
+      std::sqrt(plane_squared / component.size());
+  if (supported_plane_rmse > c.max_plane_rmse)
+    return {};
+  if ((hi - lo).maxCoeff() > 2 * c.max_radius + c.plane_distance * 2 ||
+      (hi - lo).minCoeff() < c.min_radius * .7)
+    return {};
+  for (const auto &p : all) {
+    const auto q = axis.local(p);
+    if (q.head<2>().norm() > 2 * c.max_radius + .05 || q.z() < -.03 ||
+        q.z() > c.bucket_height + .20)
+      continue;
+    context.push_back(q);
+    if (q.z() >= .035 && q.z() <= c.bucket_height + c.height_tolerance)
+      side.push_back(q);
+  }
+  if (side.size() < static_cast<size_t>(std::max(10, c.min_side_points)))
+    return {};
+  for (const auto &p : current)
+    fresh.push_back(axis.local(p));
+  std::optional<Bottom> best;
+  std::mt19937 rng(0x20261026);
+  for (int ri = 0; ri <= 6; ++ri) {
+    const double seed_radius =
+        c.min_radius + (c.max_radius - c.min_radius) * ri / 6.;
+    for (int k = 0; k < std::min(cfg.ransac_iterations, 40); ++k) {
+      const auto a = side[rng() % side.size()], b = side[rng() % side.size()];
+      for (auto center : shape_centers(a, b, seed_radius, cfg)) {
+        if (center.norm() > c.max_radius)
+          continue;
+        double radius = seed_radius;
+        if (!refine_shape(side, center, radius, cfg, true) ||
+            center.norm() > radius * .9)
+          continue;
+        int interior = 0, outside = 0;
+        for (const auto &p : floor) {
+          const double r = (p.head<2>() - center).norm();
+          interior += r < radius * .7;
+          outside += r > radius + c.plane_distance;
+        }
+        if (interior < 3 || outside > static_cast<int>(floor.size() * .1))
+          continue;
+        const auto evidence = shape_evidence(context, center, radius, cfg);
+        const auto now = shape_evidence(fresh, center, radius, cfg);
+        if (evidence.sides < std::max(10, c.min_side_points) ||
+            evidence.sides < .65 * evidence.shell ||
+            evidence.arc < cfg.min_arc ||
+            evidence.high - evidence.low <
+                std::max(c.min_side_span, c.bucket_height * .65) ||
+            evidence.high < c.bucket_height - .08 || evidence.solid >= 4 ||
+            evidence.continuing >= 4 ||
+            now.plane + now.sides < c.min_current_points || now.sides < 2 ||
+            now.sides < .6 * now.shell || now.arc < .6 || now.solid >= 4 ||
+            now.continuing >= 4)
+          continue;
+        const double residual = std::sqrt(evidence.squared / evidence.sides);
+        if (residual > shape_tolerance(cfg))
+          continue;
+        Bottom result;
+        result.center = axis.world(center);
+        if (result.center.z() + c.bucket_height <
+                cfg.min_opening_z - c.height_tolerance ||
+            result.center.z() + c.bucket_height >
+                cfg.max_opening_z + c.height_tolerance)
+          continue;
+        result.normal = normal;
+        result.radius = radius;
+        result.plane_rmse = std::max(plane_rmse, supported_plane_rmse);
+        result.boundary_residual = residual;
+        result.plane_points = floor.size() - outside;
+        result.current_points = now.plane + now.sides;
+        result.side_points = evidence.sides;
+        result.score = std::log1p(result.plane_points) +
+                       std::log1p(evidence.sides) + evidence.arc / pi -
+                       residual / shape_tolerance(cfg) -
+                       result.plane_rmse / c.max_plane_rmse;
+        if (!best || result.score > best->score)
+          best = result;
+      }
+    }
+  }
+  return best;
+}
+} // namespace
+
+std::optional<Bottom> fit_bucket_shape(const Points &accumulated,
+                                       const Points &current,
+                                       const Config &cfg) {
+  cfg.validate();
+  if (!cfg.bottom.sparse_shape_enabled || current.empty() ||
+      current.size() > static_cast<size_t>(cfg.max_model_points) ||
+      accumulated.size() > static_cast<size_t>(cfg.max_model_points))
+    return {};
+  Points finite, fresh;
+  for (const auto &p : accumulated)
+    if (p.allFinite() && p.cwiseAbs().maxCoeff() <= 200)
+      finite.push_back(p);
+  for (const auto &p : current)
+    if (p.allFinite() && p.cwiseAbs().maxCoeff() <= 200)
+      fresh.push_back(p);
+  std::vector<Bottom> candidates;
+  const double lower = cfg.min_opening_z - cfg.bottom.bucket_height -
+                       cfg.bottom.height_tolerance;
+  const double upper = cfg.max_opening_z - cfg.bottom.bucket_height +
+                       cfg.bottom.height_tolerance;
+  for (double z = lower; z <= upper; z += cfg.bottom.plane_distance) {
+    Points slice;
+    for (const auto &p : finite)
+      if (std::abs(p.z() - z) <= cfg.bottom.plane_distance)
+        slice.push_back(p);
+    for (const auto &patch : patches(
+             slice, std::max(cfg.bottom.connection_m, cfg.bottom.min_radius))) {
+      auto fit = fit_sparse_patch(patch, finite, fresh, cfg);
+      if (!fit)
+        continue;
+      bool merged = false;
+      for (auto &old : candidates) {
+        if ((old.center - fit->center).norm() < .05) {
+          if (fit->score > old.score)
+            old = *fit;
+          merged = true;
+          break;
+        }
+      }
+      if (!merged)
+        candidates.push_back(*fit);
+    }
+  }
+  if (candidates.empty())
+    return {};
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto &a, const auto &b) { return a.score > b.score; });
+  if (candidates.size() > 1 && candidates[1].score > candidates[0].score - .7)
+    return {};
+  return candidates.front();
+}
+std::optional<Bottom> track_bucket_shape(const Bottom &learned,
+                                         const Points &current,
+                                         const Config &cfg) {
+  cfg.validate();
+  if (!cfg.bottom.sparse_shape_enabled || !learned.center.allFinite() ||
+      !learned.normal.allFinite() ||
+      std::abs(learned.normal.norm() - 1.) > .01 ||
+      learned.normal.z() < std::cos(cfg.bottom.max_tilt_rad) ||
+      learned.radius < cfg.bottom.min_radius ||
+      learned.radius > cfg.bottom.max_radius ||
+      current.size() > static_cast<size_t>(cfg.max_model_points))
+    return {};
+  const auto axis = shape_axis(learned.center, learned.normal);
+  const double correction_limit =
+      std::min({.30, cfg.crop_margin, cfg.association_m});
+  Points context, side;
+  for (const auto &p : current) {
+    if (!p.allFinite())
+      continue;
+    const auto q = axis.local(p);
+    if (q.head<2>().norm() >
+        cfg.nominal_radius + cfg.bottom.side_tolerance + correction_limit)
+      continue;
+    context.push_back(q);
+    if (q.z() > .035 &&
+        q.z() < cfg.bottom.bucket_height + cfg.bottom.height_tolerance)
+      side.push_back(q);
+  }
+  if (side.size() < static_cast<size_t>(cfg.bottom.shape_tracking_min_points))
+    return {};
+  std::vector<XY> seeds{XY::Zero()};
+  std::mt19937 rng(0x20261027);
+  for (int i = 0; i < 32; ++i) {
+    const auto &a = side[rng() % side.size()];
+    const auto &b = side[rng() % side.size()];
+    for (const auto &seed : shape_centers(a, b, learned.radius, cfg))
+      if (seed.norm() <= correction_limit)
+        seeds.push_back(seed);
+  }
+  std::optional<Bottom> best;
+  double best_quality = std::numeric_limits<double>::infinity();
+  bool ambiguous = false;
+  for (auto center : seeds) {
+    double radius = learned.radius;
+    if (!refine_shape(side, center, radius, cfg, false) ||
+        center.norm() > correction_limit)
+      continue;
+    const auto now = shape_evidence(context, center, radius, cfg);
+    if (now.sides < cfg.bottom.shape_tracking_min_points ||
+        now.sides < .65 * now.shell || now.arc < 1.05 ||
+        now.high - now.low < cfg.bottom.min_side_span || now.solid >= 4 ||
+        now.continuing >= 4)
+      continue;
+    const double residual = std::sqrt(now.squared / now.sides);
+    // Three points can update an established shape only with tighter residuals.
+    // A large correction must be supported by a broad current frustum, not a
+    // few points from an adjacent fixture.
+    if (now.sides < 4 && residual > shape_tolerance(cfg) * .5)
+      continue;
+    if (center.norm() > .10 &&
+        (now.sides < std::max(6, cfg.bottom.min_current_points) ||
+         now.arc < cfg.min_arc ||
+         now.high - now.low < std::max(cfg.bottom.min_side_span,
+                                       cfg.bottom.bucket_height * .65)))
+      continue;
+    const double quality =
+        residual + shape_tolerance(cfg) * (1. - static_cast<double>(now.sides) /
+                                                    std::max(1, now.shell));
+    const Point fitted_center = axis.world(center);
+    const bool different = best && (best->center - fitted_center).norm() > .04;
+    if (different && std::abs(quality - best_quality) < .002)
+      ambiguous = true;
+    if (quality < best_quality) {
+      if (quality + .002 < best_quality)
+        ambiguous = false;
+      Bottom result = learned;
+      result.center = fitted_center;
+      result.current_points = result.side_points = now.sides;
+      result.plane_points = now.plane;
+      result.boundary_residual = residual;
+      best = result;
+      best_quality = quality;
+    }
+  }
+  if (ambiguous)
+    return {};
+  return best;
+}
+
+} // namespace lidar_perception_system::opening

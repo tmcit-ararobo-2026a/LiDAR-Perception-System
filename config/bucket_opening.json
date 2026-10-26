@@ -32,6 +32,8 @@
     "ransac_iterations": 80
   },
   "bottom": {
+    "sparse_shape_enabled": true,
+    "shape_tracking_min_points": 3,
     "bucket_height": 0.255,
     "height_tolerance": 0.035,
     "min_radius": 0.075,

@@ -30,6 +30,8 @@ struct BottomConfig {
   // Zero retains a learned semantic mount while the same body is observed.
   double max_body_inference_s{0.0};
   int min_plane_points{20}, min_current_points{4}, min_side_points{6};
+  bool sparse_shape_enabled{true};
+  int shape_tracking_min_points{3};
 };
 
 struct Config {
@@ -77,7 +79,11 @@ std::optional<Bottom> fit_bucket_bottom(const Points& accumulated, const Points&
                                         const Config& config);
 std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& current,
                                           const Config& config);
-enum class BottomMode { None = 0, Direct = 1, PlaneTracked = 2, BodyInferred = 3 };
+std::optional<Bottom> fit_bucket_shape(const Points& accumulated, const Points& current,
+                                       const Config& config);
+std::optional<Bottom> track_bucket_shape(const Bottom& learned, const Points& current,
+                                         const Config& config);
+enum class BottomMode { None = 0, Direct = 1, PlaneTracked = 2, BodyInferred = 3, ShapeFitted = 4 };
 
 struct FitStats {
   int max_slice_points{0}, radius_hypotheses{0}, geometry_hypotheses{0}, edge_hypotheses{0};
@@ -94,6 +100,7 @@ struct Result {
   int recovery_attempts{0};
   bool motion_seeded{false};
   bool bottom_valid{false};
+  bool bottom_shape_fitted{false};
   double bottom_observation_stamp{0};
   std::optional<Bottom> bottom;
   BottomMode bottom_tracking_mode{BottomMode::None};
@@ -177,6 +184,7 @@ class Tracker {
   std::optional<LostModel> lost_model_;
   double learned_bottom_stamp_{0};
   int bottom_hits_{0};
+  bool bottom_pending_shape_{false};
   double bottom_stamp_{0};
   Point position_{0, 0, 0}, measured_{0, 0, 0}, velocity_{0, 0, 0};
   double observation_stamp_{0}, variance_{1};

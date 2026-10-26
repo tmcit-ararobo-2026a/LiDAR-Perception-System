@@ -116,7 +116,7 @@ def main():
             return
         stamp = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
         if message.valid:
-            bottom_observations[stamp] = message.track_id
+            bottom_observations[stamp] = (message.track_id, message.observation_mode)
     subscriptions.append(node.create_subscription(BucketBottom,
         '/bucket_opening_tracker/bottom', bottom, 100))
     def bottom_track(message):
@@ -238,13 +238,16 @@ def main():
                 'valid_track_ids': len({track for valid, _, track in measured if valid})}
         report['opening_confirmed'] = report['streams']['opening']['direct_results'] > 0
         report['bottom'] = {'valid_measurements': len(bottom_observations),
-                            'track_ids': len(set(bottom_observations.values())),
+            'track_ids': len({track for track, _ in bottom_observations.values()}),
+            'direct': sum(mode == BucketBottom.DIRECT for _, mode in bottom_observations.values()),
+            'shape_fitted': sum(mode == BucketBottom.SHAPE_FITTED for _, mode in bottom_observations.values()),
                             'accuracy_evaluated': False}
         track_stamps = sorted(bottom_tracks)
         report['bottom_tracking'] = {
             'valid_outputs': len(bottom_tracks),
             'direct': sum(mode == BucketBottom.DIRECT for mode, _ in bottom_tracks.values()),
             'plane_tracked': sum(mode == BucketBottom.PLANE_TRACKED for mode, _ in bottom_tracks.values()),
+            'shape_fitted': sum(mode == BucketBottom.SHAPE_FITTED for mode, _ in bottom_tracks.values()),
             'body_inferred': sum(mode == BucketBottom.BODY_INFERRED for mode, _ in bottom_tracks.values()),
             'track_ids': len({track for _, track in bottom_tracks.values()}),
             'max_gap_between_valid_outputs_s': max(

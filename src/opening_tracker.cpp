@@ -166,7 +166,8 @@ void Config::validate() const {
       bottom.min_side_span > bottom.bucket_height || bottom.min_plane_points < 6 ||
       bottom.min_plane_points > max_model_points || bottom.min_current_points < 3 ||
       bottom.min_side_points < 3 || bottom.max_body_inference_s < 0 ||
-      bottom.max_body_inference_s > 10) {
+      bottom.max_body_inference_s > 10 || bottom.shape_tracking_min_points < 3 ||
+      bottom.shape_tracking_min_points > max_model_points) {
     throw std::invalid_argument("Invalid bottom geometry bounds");
   }
   if (field_min_x >= field_max_x || field_min_y >= field_max_y ||
@@ -222,6 +223,7 @@ void Tracker::clear_model() {
   learned_bottom_.reset();
   learned_bottom_stamp_ = 0;
   bottom_hits_ = 0;
+  bottom_pending_shape_ = false;
   bottom_stamp_ = 0;
   body_stamp_ = 0;
   acquired_stamp_ = 0;
@@ -1367,7 +1369,12 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     frames_.pop_front();
   }
   rebuild(stamp);
-  auto bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
+  const auto detect_bottom = [&]() {
+    auto measured = fit_bucket_bottom(accumulated_, upper, cfg_);
+    if (measured) return std::make_pair(measured, false);
+    return std::make_pair(fit_bucket_shape(accumulated_, upper, cfg_), true);
+  };
+  auto [bottom, shape_fitted] = detect_bottom();
   if (bottom && !cfg_.inside_field(pose_.world(bottom->center))) bottom.reset();
   if (bottom && last_bottom_ &&
       std::abs(bottom->center.z() - last_bottom_->center.z()) > cfg_.height_change_m) {
@@ -1376,7 +1383,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     for (auto& previous : frames_) previous.upper.clear();
     frames_.back().upper = upper;
     rebuild(stamp);
-    bottom = fit_bucket_bottom(accumulated_, upper, cfg_);
+    std::tie(bottom, shape_fitted) = detect_bottom();
     if (bottom && !cfg_.inside_field(pose_.world(bottom->center))) bottom.reset();
     bottom_hits_ = 0;
     last_bottom_.reset();
@@ -1394,15 +1401,20 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     last_bottom_ = bottom;
     bottom_stamp_ = stamp;
     result.bottom = bottom;
+    result.bottom_shape_fitted = shape_fitted;
+    bottom_pending_shape_ = shape_fitted;
     result.bottom_valid = bottom_hits_ >= cfg_.confirm_hits;
     if (result.bottom_valid) {
       identified_ = true;
       learned_bottom_ = bottom;
       learned_bottom_stamp_ = stamp;
-      result.bottom_tracking_mode = BottomMode::Direct;
+      result.bottom_tracking_mode = shape_fitted ? BottomMode::ShapeFitted : BottomMode::Direct;
     }
   } else {
-    bottom_hits_ = 0;
+    // Sparse scans may provide side evidence between two floor observations.
+    // Retain only the unconfirmed hit count for the normal freshness interval;
+    // no recognized bottom or new observation stamp is emitted during a miss.
+    if (!bottom_pending_shape_ || stamp - bottom_stamp_ > cfg_.prediction_s) bottom_hits_ = 0;
   }
   result.bottom_observation_stamp = bottom_stamp_;
   if (!result.bottom_valid && learned_bottom_) {
@@ -1415,6 +1427,10 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       learned_bottom_ = plane;
       learned_bottom_stamp_ = stamp;
       result.bottom_tracking_mode = BottomMode::PlaneTracked;
+    } else if (auto shape = track_bucket_shape(*learned_bottom_, upper, cfg_)) {
+      learned_bottom_ = shape;
+      learned_bottom_stamp_ = stamp;
+      result.bottom_tracking_mode = BottomMode::ShapeFitted;
     } else if (!bottom ||
                (bottom->center - learned_bottom_->center).norm() <= cfg_.height_change_m) {
       result.bottom_tracking_mode = BottomMode::BodyInferred;
