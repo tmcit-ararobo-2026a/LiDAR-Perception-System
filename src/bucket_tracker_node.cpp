@@ -106,6 +106,7 @@ op::Config read_config(const nlohmann::json& j) {
 #undef READ
   const auto bottom = j.value("bottom", nlohmann::json::object());
 #define READ_BOTTOM(field) c.bottom.field = bottom.value(#field, c.bottom.field)
+  READ_BOTTOM(horizontal_only);
   READ_BOTTOM(bucket_height);
   READ_BOTTOM(height_tolerance);
   READ_BOTTOM(min_radius);

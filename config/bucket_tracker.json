@@ -32,6 +32,7 @@
     "ransac_iterations": 80
   },
   "bottom": {
+    "horizontal_only": true,
     "output_smoothing_s": 0.15,
     "output_max_acceleration_mps2": 6.0,
     "output_stationary_radius_m": 0.025,

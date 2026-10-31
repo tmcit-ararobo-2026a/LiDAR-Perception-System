@@ -22,6 +22,7 @@ struct Pose {
 };
 
 struct BottomConfig {
+  bool horizontal_only{true};
   // Standard competition bucket dimensions, not a robot mounting position.
   double bucket_height{0.255}, height_tolerance{0.035};
   double min_radius{0.075}, max_radius{0.135};

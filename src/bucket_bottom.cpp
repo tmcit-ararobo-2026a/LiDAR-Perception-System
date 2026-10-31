@@ -94,7 +94,9 @@ std::optional<Bottom> fit_patch(const Points& p, const Points& all, const Points
   if (eig.info() != Eigen::Success || eig.eigenvalues()[1] < 0.00035) return {};
   Point normal = eig.eigenvectors().col(0);
   if (normal.z() < 0) normal = -normal;
-  const double rmse = std::sqrt(std::max(0., eig.eigenvalues()[0]));
+  if (c.horizontal_only) normal = Point::UnitZ();
+  const double rmse = std::sqrt(std::max(0., c.horizontal_only ? covariance(2, 2)
+                                                                         : eig.eigenvalues()[0]));
   if (normal.z() < std::cos(c.max_tilt_rad) || rmse > c.max_plane_rmse) return {};
   std::vector<XY> xy;
   XY lo = p.front().head<2>(), hi = lo;
@@ -251,7 +253,8 @@ std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& c
   Points support;
   for (const auto& p : current) {
     if (p.allFinite() && (p.head<2>() - learned.center.head<2>()).norm() < learned.radius &&
-        std::abs(learned.normal.dot(p - learned.center)) <= cfg.bottom.plane_distance)
+        std::abs((cfg.bottom.horizontal_only ? p.z() - learned.center.z()
+                                              : learned.normal.dot(p - learned.center))) <= cfg.bottom.plane_distance)
       support.push_back(p);
   }
   if (support.size() < static_cast<size_t>(cfg.bottom.min_current_points)) return {};
@@ -265,7 +268,9 @@ std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& c
   if (eig.info() != Eigen::Success || eig.eigenvalues()[1] < .0001) return {};
   Point normal = eig.eigenvectors().col(0);
   if (normal.z() < 0) normal = -normal;
-  const double rmse = std::sqrt(std::max(0., eig.eigenvalues()[0]));
+  if (cfg.bottom.horizontal_only) normal = Point::UnitZ();
+  const double rmse = std::sqrt(std::max(0., cfg.bottom.horizontal_only ? covariance(2, 2)
+                                                                                  : eig.eigenvalues()[0]));
   if (normal.z() < std::cos(cfg.bottom.max_tilt_rad) ||
       normal.dot(learned.normal) < std::cos(cfg.bottom.max_tilt_rad) ||
       rmse > cfg.bottom.max_plane_rmse)
@@ -427,7 +432,9 @@ std::optional<Bottom> fit_sparse_patch(const Points &plane, const Points &all,
   Point normal = eig.eigenvectors().col(0);
   if (normal.z() < 0)
     normal = -normal;
-  const double plane_rmse = std::sqrt(std::max(0., eig.eigenvalues()[0]));
+  if (c.horizontal_only) normal = Point::UnitZ();
+  const double plane_rmse = std::sqrt(std::max(0., c.horizontal_only ? covariance(2, 2)
+                                                                               : eig.eigenvalues()[0]));
   if (normal.z() < std::cos(c.max_tilt_rad) || plane_rmse > c.max_plane_rmse)
     return {};
   const auto axis = shape_axis(mean, normal);
@@ -617,7 +624,9 @@ std::optional<Bottom> track_bucket_shape(const Bottom &learned,
       learned.radius > cfg.bottom.max_radius ||
       current.size() > static_cast<size_t>(cfg.max_model_points))
     return {};
-  const auto axis = shape_axis(learned.center, learned.normal);
+  Point normal = learned.normal;
+  if (cfg.bottom.horizontal_only) normal = Point::UnitZ();
+  const auto axis = shape_axis(learned.center, normal);
   const double correction_limit =
       std::min({.30, cfg.crop_margin, cfg.association_m});
   Points context, side;
@@ -681,6 +690,7 @@ std::optional<Bottom> track_bucket_shape(const Bottom &learned,
       if (quality + .002 < best_quality)
         ambiguous = false;
       Bottom result = learned;
+      result.normal = normal;
       result.center = fitted_center;
       // Side-only registration observes XY, not a new floor height. Moving
       // along the learned (noisy/tilted) plane would turn XY corrections into
