@@ -26,6 +26,7 @@
 #include "lidar_perception_system/msg/bucket_bottom.hpp"
 #include "lidar_perception_system/msg/moving_bucket_track.hpp"
 #include "lidar_perception_system/opening_tracker.hpp"
+#include "lidar_perception_system/bottom_pose_filter.hpp"
 
 namespace op = lidar_perception_system::opening;
 using Track = lidar_perception_system::msg::MovingBucketTrack;
@@ -169,6 +170,10 @@ class BucketTracker : public rclcpp::Node {
     }
     const auto j = nlohmann::json::parse(stream);
     cfg_ = read_config(j);
+    bottom_pose_filter_ = op::BottomPoseFilter(
+        j.value("bottom", nlohmann::json::object()).value("output_smoothing_s", .15),
+        j.value("bottom", nlohmann::json::object()).value("output_max_acceleration_mps2", 6.),
+        j.value("bottom", nlohmann::json::object()).value("output_stationary_radius_m", .025));
     radius_ = cfg_.nominal_radius;
     frame_ = j.at("target_frame").get<std::string>();
     input_topic_ = j.at("input_topic").get<std::string>();
@@ -195,6 +200,7 @@ class BucketTracker : public rclcpp::Node {
     accumulated_ = create_publisher<Cloud>("bucket_opening_tracker/accumulated_cloud", rclcpp::SensorDataQoS());
     bottom_ = create_publisher<BottomTrack>("bucket_opening_tracker/bottom", 10);
     bottom_track_ = create_publisher<BottomTrack>("bucket_opening_tracker/bottom_track", 10);
+    bottom_track_raw_ = create_publisher<BottomTrack>("bucket_opening_tracker/bottom_track_raw", 10);
     bottom_markers_ =
         create_publisher<visualization_msgs::msg::MarkerArray>("bucket_opening_tracker/bottom_markers", 10);
     bottom_cloud_ = create_publisher<Cloud>("bucket_opening_tracker/bottom_cloud", rclcpp::SensorDataQoS());
@@ -540,6 +546,23 @@ class BucketTracker : public rclcpp::Node {
                                     : known_stamp->second;
     auto t =
         bottom_message(r, header, r.tracked_bottom, r.bottom_tracking_mode, geometry_stamp);
+    bottom_track_raw_->publish(t);
+    if (t.valid) {
+      op::Point center(t.center.x, t.center.y, t.center.z);
+      op::Point normal(t.normal.x, t.normal.y, t.normal.z);
+      bottom_pose_filter_.update(center, normal, rclcpp::Time(header.stamp).seconds(),
+                                 r.track_id, cfg_.reset_s, r.bottom_valid,
+                                 r.bottom_valid ||
+                                     r.bottom_tracking_mode == op::BottomMode::PlaneTracked,
+                                 r.bottom_valid ||
+                                     r.bottom_tracking_mode == op::BottomMode::ShapeFitted);
+      t.center = point(center);
+      t.normal.x = normal.x();
+      t.normal.y = normal.y();
+      t.normal.z = normal.z();
+    }
+    // Invalid input still produces an invalid output, but retain filter state
+    // through a short miss. ID/time-gap checks reset it on actual reacquisition.
     visualization_msgs::msg::MarkerArray markers;
     auto ring = base_marker(header, 0, Marker::LINE_STRIP, "bucket_bottom");
     ring.action = Marker::DELETE;
@@ -553,12 +576,11 @@ class BucketTracker : public rclcpp::Node {
     op::Points plane;
     if (t.valid) {
       const auto& b = *r.tracked_bottom;
-      const auto center = r.pose.world(b.center);
-      const op::Point normal =
-          (r.pose.world(b.normal) - r.pose.world(op::Point::Zero())).normalized();
-      // A circular bottom has no observable yaw. Use the robot's local X direction
-      // projected onto the measured plane to define a consistent tangent axis.
-      op::Point x_axis(std::cos(r.pose.yaw), std::sin(r.pose.yaw), 0);
+      const op::Point center(t.center.x, t.center.y, t.center.z);
+      const op::Point normal(t.normal.x, t.normal.y, t.normal.z);
+      // A circle has no observable yaw. A fixed map tangent avoids displaying
+      // chassis yaw-registration noise as a bucket rotation.
+      op::Point x_axis = op::Point::UnitX();
       x_axis = (x_axis - normal * normal.dot(x_axis)).normalized();
       Eigen::Matrix3d basis;
       basis.col(0) = x_axis;
@@ -824,10 +846,11 @@ class BucketTracker : public rclcpp::Node {
   std::unique_ptr<tf2_ros::TransformListener> listener_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> broadcaster_;
   rclcpp::Publisher<Track>::SharedPtr raw_;
-  rclcpp::Publisher<BottomTrack>::SharedPtr bottom_, bottom_track_;
+  rclcpp::Publisher<BottomTrack>::SharedPtr bottom_, bottom_track_, bottom_track_raw_;
   builtin_interfaces::msg::Time bottom_direct_stamp_;
   std::map<unsigned int, builtin_interfaces::msg::Time> bottom_tracking_stamps_;
   BottomTrack bottom_output_;
+  op::BottomPoseFilter bottom_pose_filter_;
   bool body_debug_valid_{false};
   std_msgs::msg::Header body_debug_header_;
   std::chrono::steady_clock::time_point body_debug_received_;

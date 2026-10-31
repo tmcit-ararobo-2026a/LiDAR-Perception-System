@@ -251,7 +251,7 @@ std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& c
   Points support;
   for (const auto& p : current) {
     if (p.allFinite() && (p.head<2>() - learned.center.head<2>()).norm() < learned.radius &&
-        std::abs(learned.normal.dot(p - learned.center)) <= cfg.height_change_m)
+        std::abs(learned.normal.dot(p - learned.center)) <= cfg.bottom.plane_distance)
       support.push_back(p);
   }
   if (support.size() < static_cast<size_t>(cfg.bottom.min_current_points)) return {};
@@ -275,7 +275,10 @@ std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& c
   // measured plane height/normal, keeping the previously recognized local XY.
   tracked.center.z() =
       mean.z() - normal.head<2>().dot(learned.center.head<2>() - mean.head<2>()) / normal.z();
-  if (std::abs(tracked.center.z() - learned.center.z()) > cfg.height_change_m) return {};
+  // A few nearby returns cannot establish a lift: a side wall or bracket can
+  // form a plausible small plane within height_change_m. Only update the
+  // learned floor within its plane tolerance; larger lifts need full geometry.
+  if (std::abs(tracked.center.z() - learned.center.z()) > cfg.bottom.plane_distance) return {};
   tracked.normal = normal;
   tracked.plane_rmse = rmse;
   tracked.plane_points = tracked.current_points = static_cast<int>(support.size());
@@ -303,7 +306,7 @@ double shape_tolerance(const Config& cfg) {
   return std::min(cfg.bottom.plane_distance, cfg.bottom.side_tolerance * .5);
 }
 struct ShapeEvidence {
-  int sides{0}, plane{0}, solid{0}, continuing{0}, shell{0};
+  int sides{0}, plane{0}, solid{0}, cap{0}, continuing{0}, shell{0};
   double squared{0}, low{1e9}, high{-1e9}, arc{0};
 };
 ShapeEvidence shape_evidence(const Points &points, const XY &center,
@@ -319,6 +322,10 @@ ShapeEvidence shape_evidence(const Points &points, const XY &center,
     if (z > .08 && z < cfg.bottom.bucket_height + cfg.bottom.height_tolerance &&
         r < shape_radius(radius, z, cfg) * .75)
       ++e.solid;
+    if (z > cfg.bottom.bucket_height - .035 &&
+        z < cfg.bottom.bucket_height + cfg.bottom.height_tolerance &&
+        r < shape_radius(radius, z, cfg) * .75)
+      ++e.cap;
     if (z > cfg.bottom.bucket_height + cfg.bottom.height_tolerance &&
         z < cfg.bottom.bucket_height + .20 && r > radius * .6 &&
         r < cfg.nominal_radius + cfg.bottom.side_tolerance)
@@ -484,7 +491,7 @@ std::optional<Bottom> fit_sparse_patch(const Points &plane, const Points &all,
           continue;
         double radius = seed_radius;
         if (!refine_shape(side, center, radius, cfg, true) ||
-            center.norm() > radius * .9)
+            center.norm() > radius * 1.5)
           continue;
         int interior = 0, outside = 0;
         for (const auto &p : floor) {
@@ -492,19 +499,29 @@ std::optional<Bottom> fit_sparse_patch(const Points &plane, const Points &all,
           interior += r < radius * .7;
           outside += r > radius + c.plane_distance;
         }
-        if (interior < 3 || outside > static_cast<int>(floor.size() * .1))
+        // A small coplanar mounting plate can extend beyond the disk. The
+        // whole-component envelope above still rejects large decks; require
+        // most of this component to support the disk and validate its sides.
+        if (interior < 3 || outside > static_cast<int>(floor.size() * .5))
           continue;
         const auto evidence = shape_evidence(context, center, radius, cfg);
         const auto now = shape_evidence(fresh, center, radius, cfg);
         if (evidence.sides < std::max(10, c.min_side_points) ||
-            evidence.sides < .65 * evidence.shell ||
+            evidence.sides < .5 * evidence.shell ||
             evidence.arc < cfg.min_arc ||
             evidence.high - evidence.low <
                 std::max(c.min_side_span, c.bucket_height * .65) ||
-            evidence.high < c.bucket_height - .08 || evidence.solid >= 4 ||
+            // Registration noise and internal returns grow with accumulation
+            // density. Reject solid objects by their support ratio as well as
+            // a minimum count, instead of a fixed four-point limit.
+            evidence.high < c.bucket_height - .08 ||
+            evidence.solid >= std::max(4., .15 * evidence.sides) ||
+            evidence.cap >= 4 ||
             evidence.continuing >= 4 ||
             now.plane + now.sides < c.min_current_points || now.sides < 2 ||
-            now.sides < .6 * now.shell || now.arc < .6 || now.solid >= 4 ||
+            // One scan sees a narrow arc; the accumulated shell above must
+            // still span min_arc and the full vertical extent.
+            now.sides < .3 * now.shell || now.arc < .3 || now.solid >= 4 ||
             now.continuing >= 4)
           continue;
         const double residual = std::sqrt(evidence.squared / evidence.sides);
@@ -665,6 +682,10 @@ std::optional<Bottom> track_bucket_shape(const Bottom &learned,
         ambiguous = false;
       Bottom result = learned;
       result.center = fitted_center;
+      // Side-only registration observes XY, not a new floor height. Moving
+      // along the learned (noisy/tilted) plane would turn XY corrections into
+      // artificial vertical motion and accumulate height drift.
+      result.center.z() = learned.center.z();
       result.current_points = result.side_points = now.sides;
       result.plane_points = now.plane;
       result.boundary_residual = residual;

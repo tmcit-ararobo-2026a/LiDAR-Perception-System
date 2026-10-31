@@ -32,12 +32,15 @@
     "ransac_iterations": 80
   },
   "bottom": {
+    "output_smoothing_s": 0.15,
+    "output_max_acceleration_mps2": 6.0,
+    "output_stationary_radius_m": 0.025,
     "sparse_shape_enabled": true,
     "shape_tracking_min_points": 3,
     "bucket_height": 0.255,
     "height_tolerance": 0.035,
     "min_radius": 0.075,
-    "max_radius": 0.135,
+    "max_radius": 0.115,
     "plane_distance": 0.012,
     "max_plane_rmse": 0.008,
     "max_tilt_rad": 0.1745329252,
