@@ -19,18 +19,18 @@ def replay_static_tf(context):
 
 def generate_launch_description():
     share = get_package_share_directory('lidar_perception_system')
-    config = os.path.join(share, 'config', 'bucket_opening.json')
+    config = os.path.join(share, 'config', 'bucket_tracker.json')
     return LaunchDescription([
         DeclareLaunchArgument('config_file', default_value=config),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('bag_path', default_value=''),
         OpaqueFunction(function=replay_static_tf),
         IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(
-            share, 'launch', 'bucket_opening.launch.py')), launch_arguments={
+            share, 'launch', 'bucket_tracker.launch.py')), launch_arguments={
                 'config_file': LaunchConfiguration('config_file'),
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
             }.items()),
         Node(package='rviz2', executable='rviz2', name='opening_rviz',
-             arguments=['-d', os.path.join(share, 'rviz', 'bucket_opening.rviz')],
+             arguments=['-d', os.path.join(share, 'rviz', 'bucket_tracker.rviz')],
              parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}]),
     ])

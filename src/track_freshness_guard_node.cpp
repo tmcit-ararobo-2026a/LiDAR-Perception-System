@@ -133,7 +133,7 @@ private:
       observation_timeout_s_ - observation_age_s));
     have_track_ = true;
   }
-  /** @brief Independently expire input/result/observation leases, even if CUDA stalls. */
+  /** @brief Independently expire input/result/observation leases, even if the tracker stalls. */
   void evaluate() {
     const auto current_ns = now().nanoseconds();
     if (last_ros_now_ns_ > 0 && current_ns < last_ros_now_ns_) {
@@ -193,7 +193,7 @@ private:
 };
 }  // namespace lidar_perception_system
 
-/** @brief Start only the CPU guard; it does not allocate a CUDA context. */
+/** @brief Start the independent track freshness guard. */
 int main(int argc, char ** argv) {
   rclcpp::init(argc, argv);
   try {

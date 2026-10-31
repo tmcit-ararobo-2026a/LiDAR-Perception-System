@@ -159,9 +159,9 @@ Cloud make_cloud(const op::Points& points, const std_msgs::msg::Header& header) 
 }
 }  // namespace
 
-class BucketOpeningTracker : public rclcpp::Node {
+class BucketTracker : public rclcpp::Node {
  public:
-  BucketOpeningTracker() : Node("bucket_opening_tracker") {
+  BucketTracker() : Node("bucket_tracker") {
     const auto path = declare_parameter<std::string>("config_file", "");
     std::ifstream stream(path);
     if (!stream) {
@@ -186,21 +186,22 @@ class BucketOpeningTracker : public rclcpp::Node {
     buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     listener_ = std::make_unique<tf2_ros::TransformListener>(*buffer_);
     broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-    raw_ = create_publisher<Track>("~/target_raw", 1);
-    diagnostics_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("~/diagnostics", 10);
-    markers_ = create_publisher<visualization_msgs::msg::MarkerArray>("~/markers", 1);
-    robot_markers_ = create_publisher<visualization_msgs::msg::MarkerArray>("~/robot_markers", 1);
-    selected_ = create_publisher<Cloud>("~/selected_cloud", rclcpp::SensorDataQoS());
-    accumulated_ = create_publisher<Cloud>("~/accumulated_cloud", rclcpp::SensorDataQoS());
-    bottom_ = create_publisher<BottomTrack>("~/bottom", 10);
-    bottom_track_ = create_publisher<BottomTrack>("~/bottom_track", 10);
+    // Keep the existing topic names independent of the node name.
+    raw_ = create_publisher<Track>("bucket_opening_tracker/target_raw", 1);
+    diagnostics_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("bucket_opening_tracker/diagnostics", 10);
+    markers_ = create_publisher<visualization_msgs::msg::MarkerArray>("bucket_opening_tracker/markers", 1);
+    robot_markers_ = create_publisher<visualization_msgs::msg::MarkerArray>("bucket_opening_tracker/robot_markers", 1);
+    selected_ = create_publisher<Cloud>("bucket_opening_tracker/selected_cloud", rclcpp::SensorDataQoS());
+    accumulated_ = create_publisher<Cloud>("bucket_opening_tracker/accumulated_cloud", rclcpp::SensorDataQoS());
+    bottom_ = create_publisher<BottomTrack>("bucket_opening_tracker/bottom", 10);
+    bottom_track_ = create_publisher<BottomTrack>("bucket_opening_tracker/bottom_track", 10);
     bottom_markers_ =
-        create_publisher<visualization_msgs::msg::MarkerArray>("~/bottom_markers", 10);
-    bottom_cloud_ = create_publisher<Cloud>("~/bottom_cloud", rclcpp::SensorDataQoS());
+        create_publisher<visualization_msgs::msg::MarkerArray>("bucket_opening_tracker/bottom_markers", 10);
+    bottom_cloud_ = create_publisher<Cloud>("bucket_opening_tracker/bottom_cloud", rclcpp::SensorDataQoS());
     clouds_ =
         create_subscription<Cloud>(input_topic_, rclcpp::SensorDataQoS(),
                                    [this](Cloud::ConstSharedPtr c) { receive(std::move(c)); });
-    final_ = create_subscription<Track>("~/target", 1,
+    final_ = create_subscription<Track>("bucket_opening_tracker/target", 1,
                                         [this](Track::ConstSharedPtr t) { show_final(*t); });
     fixed_ = create_subscription<tf2_msgs::msg::TFMessage>(
         "/tf_static", rclcpp::QoS(1).transient_local().reliable(),
@@ -844,9 +845,9 @@ class BucketOpeningTracker : public rclcpp::Node {
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   try {
-    rclcpp::spin(std::make_shared<BucketOpeningTracker>());
+    rclcpp::spin(std::make_shared<BucketTracker>());
   } catch (const std::exception& e) {
-    RCLCPP_FATAL(rclcpp::get_logger("bucket_opening_tracker"), "%s", e.what());
+    RCLCPP_FATAL(rclcpp::get_logger("bucket_tracker"), "%s", e.what());
     rclcpp::shutdown();
     return 1;
   }

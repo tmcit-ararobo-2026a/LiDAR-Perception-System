@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import time
 
-from ament_index_python.packages import get_package_prefix, get_package_share_directory
+from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -62,10 +62,6 @@ def main():
                         help='Replay this many seconds before offset, retaining the learned model')
     parser.add_argument('--recompute-localization', action='store_true',
                         help='Launch gn10_pointcloud_localization using recorded LiDAR/IMU only')
-    parser.add_argument('--baseline-executable', type=Path,
-                        help='Optional existing CUDA moving_bucket_detector executable')
-    parser.add_argument('--baseline-config', type=Path, default=Path(get_package_share_directory(
-        'lidar_perception_system')) / 'config' / 'moving_bucket.json')
     parser.add_argument('--output', type=Path, default=Path('/tmp/lps_opening_benchmark.json'))
     args = parser.parse_args()
     if (not args.bag.exists() or not all(math.isfinite(x) for x in
@@ -75,8 +71,6 @@ def main():
     config = json.loads(args.config.read_text())
     if not isinstance(config.get('opponent_roi'), dict):
         parser.error('config must specify opponent_roi')
-    if args.baseline_executable and not args.baseline_executable.is_file():
-        parser.error('baseline executable does not exist')
     if args.recompute_localization:
         get_package_share_directory('gn10_pointcloud_localization')
         static_message = None
@@ -129,8 +123,6 @@ def main():
         lambda m: cloud_count.__setitem__(0, cloud_count[0] + int(in_evaluation(m.header.stamp))),
         rclpy.qos.qos_profile_sensor_data))
     prefixes = {'opening': '/bucket_opening_tracker'}
-    if args.baseline_executable:
-        prefixes['baseline'] = '/moving_bucket_detector'
     for name, prefix in prefixes.items():
         streams[name] = {'raw': {}, 'final_valid': set(), 'final_invalid_reports': 0}
         reasons[name] = Counter()
@@ -183,14 +175,8 @@ def main():
         if args.recompute_localization:
             launch('localization', ['ros2', 'launch', 'gn10_pointcloud_localization',
                                     'localization.launch.py', 'use_sim_time:=true'])
-        launch('opening', ['ros2', 'launch', 'lidar_perception_system', 'bucket_opening.launch.py',
+        launch('opening', ['ros2', 'launch', 'lidar_perception_system', 'bucket_tracker.launch.py',
                            'use_sim_time:=true', 'config_file:=' + str(args.config.resolve())])
-        if args.baseline_executable:
-            launch('baseline', [str(args.baseline_executable.resolve()), '--ros-args',
-                               '-p', 'use_sim_time:=true', '-p', 'config_file:=' + str(args.baseline_config.resolve())])
-            guard = Path(get_package_prefix('lidar_perception_system')) / 'lib' / 'lidar_perception_system' / 'track_freshness_guard_node'
-            launch('baseline_guard', [str(guard), '--ros-args', '-p', 'use_sim_time:=true',
-                                      '-p', 'config_file:=' + str(args.baseline_config.resolve())])
         spin(4.)
         player = launch('bag', ['ros2', 'bag', 'play', str(args.bag.resolve()), '--clock',
                                 '--start-offset', str(args.offset - args.warmup_seconds),

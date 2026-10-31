@@ -27,7 +27,7 @@ def check_config(context):
     except (OSError, ValueError, TypeError) as error:
         raise RuntimeError(
             f'Invalid bucket config {path}: {error}. '
-            'Fix config/bucket_opening.json and rebuild the package, or set '
+            'Fix config/bucket_tracker.json and rebuild the package, or set '
             'config_file:=/absolute/path/to/config.json.') from error
     return [LogInfo(msg=f'Bucket detection config: {path}')]
 
@@ -41,11 +41,11 @@ def tracker_exited(event, context):
 
 def generate_launch_description():
     config = os.path.join(get_package_share_directory('lidar_perception_system'),
-                          'config', 'bucket_opening.json')
+                          'config', 'bucket_tracker.json')
     common = {'config_file': LaunchConfiguration('config_file'),
               'use_sim_time': LaunchConfiguration('use_sim_time')}
-    tracker = Node(package='lidar_perception_system', executable='bucket_opening_tracker',
-                   name='bucket_opening_tracker', output='screen', parameters=[common])
+    tracker = Node(package='lidar_perception_system', executable='bucket_tracker',
+                   name='bucket_tracker', output='screen', parameters=[common])
     return LaunchDescription([
         DeclareLaunchArgument('config_file', default_value=config,
                               description='JSON with an explicit map-frame opponent_roi'),

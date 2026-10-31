@@ -1,6 +1,6 @@
 #pragma once
 
-#include "lidar_perception_system/cuda_grid.hpp"
+#include "lidar_perception_system/grid_types.hpp"
 
 #include <Eigen/Core>
 

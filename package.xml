@@ -2,7 +2,7 @@
 <package format="3">
   <name>lidar_perception_system</name>
   <version>0.3.0</version>
-  <description>Robot-frame bucket opening tracking and CUDA support tracking for Robocon 2026</description>
+  <description>Robot-frame bucket opening and bottom tracking for Robocon 2026</description>
   <maintainer email="user@todo.todo">Robocon Team</maintainer>
   <license>Apache-2.0</license>
 
