@@ -35,13 +35,22 @@ using BottomTrack = lidar_perception_system::msg::BucketBottom;
 using Marker = visualization_msgs::msg::Marker;
 
 namespace {
-op::Config read_config(const nlohmann::json& j) {
+// An empty start_zone means the robot's field is unknown, so opponent_roi applies.
+const nlohmann::json& select_opponent_roi(const nlohmann::json& j, const std::string& start_zone) {
+  if (start_zone.empty()) return j.at("opponent_roi");
+  if (start_zone != "red" && start_zone != "blue") {
+    throw std::invalid_argument("start_zone must be red, blue or empty");
+  }
+  return j.at("start_zone_opponent_roi").at(start_zone);
+}
+
+op::Config read_config(const nlohmann::json& j, const std::string& start_zone) {
   if (j.at("schema_version").get<int>() != 1 || !j.contains("opponent_roi") ||
       !j.at("opponent_roi").is_object()) {
     throw std::invalid_argument("Set opponent_roi min_x/max_x/min_y/max_y in the map frame");
   }
   op::Config c;
-  const auto& roi = j.at("opponent_roi");
+  const auto& roi = select_opponent_roi(j, start_zone);
   c.min_x = roi.at("min_x").get<double>();
   c.max_x = roi.at("max_x").get<double>();
   c.min_y = roi.at("min_y").get<double>();
@@ -170,7 +179,10 @@ class BucketTracker : public rclcpp::Node {
       throw std::invalid_argument("Cannot open opening tracker config_file");
     }
     const auto j = nlohmann::json::parse(stream);
-    cfg_ = read_config(j);
+    const auto start_zone = declare_parameter<std::string>("start_zone", "");
+    cfg_ = read_config(j, start_zone);
+    RCLCPP_INFO(get_logger(), "Opponent ROI for start_zone '%s': x[%.2f, %.2f] y[%.2f, %.2f]",
+                start_zone.c_str(), cfg_.min_x, cfg_.max_x, cfg_.min_y, cfg_.max_y);
     bottom_pose_filter_ = op::BottomPoseFilter(
         j.value("bottom", nlohmann::json::object()).value("output_smoothing_s", .15),
         j.value("bottom", nlohmann::json::object()).value("output_max_acceleration_mps2", 6.),

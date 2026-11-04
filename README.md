@@ -78,7 +78,21 @@ ros2 run rviz2 rviz2 -d "$(ros2 pkg prefix --share lidar_perception_system)/rviz
 
 ## 設定
 
-既定設定は [config/bucket_tracker.json](config/bucket_tracker.json) です。入力トピック、探索範囲 `opponent_roi`、フィールド境界 `field_bounds` を使用環境の `map` 座標に合わせてください。同梱設定の変更は再ビルドで反映します。
+既定設定は [config/bucket_tracker.json](config/bucket_tracker.json) です。入力トピック、探索範囲 `opponent_roi`・`start_zone_opponent_roi`、フィールド境界 `field_bounds` を使用環境の `map` 座標に合わせてください。同梱設定の変更は再ビルドで反映します。
+
+相手ロボットの探索範囲は、各launchの `start_zone` 引数で自分のスタートゾーンを指定して切り替えます。
+
+| 引数 | 自分の位置 | 探索範囲（`map` 座標） | 使用する設定 |
+|---|---|---|---|
+| `start_zone:=red` | 赤（y < 0） | 青側 y 0.2〜5.7 | `start_zone_opponent_roi.red` |
+| `start_zone:=blue` | 青（y > 0） | 赤側 y -5.7〜-0.2 | `start_zone_opponent_roi.blue` |
+| 未指定 | 不明 | 赤・青の両側 y -5.7〜5.7 | `opponent_roi` |
+
+```bash
+ros2 launch lidar_perception_system bucket_tracker.launch.py start_zone:=red
+```
+
+起動時のログ `Opponent ROI for start_zone ...` で、適用された範囲を確認できます。
 
 別のJSONを使う場合は、各launchに `config_file:=/absolute/path/to/config.json` を追加します。
 
