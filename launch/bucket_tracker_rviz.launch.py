@@ -24,11 +24,14 @@ def generate_launch_description():
         DeclareLaunchArgument('config_file', default_value=config),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('bag_path', default_value=''),
+        DeclareLaunchArgument('start_zone', default_value='',
+                              description='Own start zone: red or blue. Unset searches both fields.'),
         OpaqueFunction(function=replay_static_tf),
         IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(
             share, 'launch', 'bucket_tracker.launch.py')), launch_arguments={
                 'config_file': LaunchConfiguration('config_file'),
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'start_zone': LaunchConfiguration('start_zone'),
             }.items()),
         Node(package='rviz2', executable='rviz2', name='opening_rviz',
              arguments=['-d', os.path.join(share, 'rviz', 'bucket_tracker.rviz')],
