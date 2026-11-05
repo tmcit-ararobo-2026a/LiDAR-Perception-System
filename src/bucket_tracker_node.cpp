@@ -91,6 +91,7 @@ op::Config read_config(const nlohmann::json& j, const std::string& start_zone) {
   READ(registration, min_overlap);
   READ(registration, min_support_spread_ratio);
   READ(registration, icp_iterations);
+  READ(registration, yaw_prior_m2);
   READ(opening, min_opening_z);
   READ(opening, max_opening_z);
   READ(opening, min_radius);
@@ -112,6 +113,15 @@ op::Config read_config(const nlohmann::json& j, const std::string& start_zone) {
   READ(tracking, body_recovery_s);
   READ(tracking, reidentification_s);
   READ(tracking, reidentification_m);
+  READ(tracking, reidentification_speed);
+  READ(tracking, reidentify_hold_s);
+  READ(tracking, identify_extent_m);
+  READ(tracking, scan_window_s);
+  READ(tracking, velocity_window_s);
+  READ(tracking, clutter_learn_s);
+  READ(tracking, clutter_forget_s);
+  READ(tracking, clutter_min_rate_hz);
+  READ(tracking, clutter_max_extent_m);
 #undef READ
   const auto bottom = j.value("bottom", nlohmann::json::object());
 #define READ_BOTTOM(field) c.bottom.field = bottom.value(#field, c.bottom.field)
@@ -132,6 +142,7 @@ op::Config read_config(const nlohmann::json& j, const std::string& start_zone) {
   READ_BOTTOM(min_side_points);
   READ_BOTTOM(sparse_shape_enabled);
   READ_BOTTOM(shape_tracking_min_points);
+  READ_BOTTOM(search_interval_s);
 #undef READ_BOTTOM
   c.prediction_s = tracking.value("max_prediction_s", c.prediction_s);
   c.validate();

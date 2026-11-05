@@ -6,6 +6,8 @@
 #include <deque>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "lidar_perception_system/support_candidates.hpp"
@@ -13,6 +15,19 @@
 namespace lidar_perception_system::opening {
 using Point = Eigen::Vector3d;
 using Points = std::vector<Point>;
+
+struct VoxelKey {
+  int x, y, z;
+  bool operator==(const VoxelKey& b) const { return x == b.x && y == b.y && z == b.z; }
+};
+struct VoxelKeyHash {
+  size_t operator()(const VoxelKey& k) const {
+    size_t h = std::hash<int>{}(k.x);
+    h ^= std::hash<int>{}(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<int>{}(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
 
 struct Pose {
   Eigen::Vector2d xy{0, 0};
@@ -33,6 +48,8 @@ struct BottomConfig {
   int min_plane_points{20}, min_current_points{4}, min_side_points{6};
   bool sparse_shape_enabled{true};
   int shape_tracking_min_points{3};
+  // Interval between full bottom searches (seconds); learned mounts are followed on every scan.
+  double search_interval_s{0.1};
 };
 
 struct Config {
@@ -58,6 +75,22 @@ struct Config {
   int ransac_iterations{80}, confirm_hits{3};
   double prediction_s{0.3}, reset_s{2.0}, association_m{0.65}, body_recovery_s{2.0};
   double reidentification_s{15.0}, reidentification_m{3.0};
+  // Search radius growth while lost (m/s), and how long a reappearing cluster is
+  // held back from a new track so the learned model can match it first (seconds).
+  double reidentification_speed{1.5}, reidentify_hold_s{0.3};
+  // A model at least this wide is robot-sized and needs no motion evidence.
+  double identify_extent_m{0.45};
+  // Recent scans are motion-compensated and registered together, because one
+  // sparse scan rarely yields enough unique correspondences. Zero disables it.
+  double scan_window_s{0.1};
+  // Span of recent poses used to fit the body velocity and yaw rate.
+  double velocity_window_s{0.4};
+  // Weight of the predicted yaw in registration, as a squared lever arm (m^2).
+  double yaw_prior_m2{0.02};
+  // A small blob returning points this long and this often is a fixture missing
+  // from the localization map. clutter_learn_s = 0 disables the mask.
+  double clutter_learn_s{3.0}, clutter_forget_s{20.0};
+  double clutter_min_rate_hz{2.0}, clutter_max_extent_m{0.6};
   BottomConfig bottom;
   bool inside_field(const Point& p) const;
   void validate() const;
@@ -80,8 +113,10 @@ std::optional<Bottom> fit_bucket_bottom(const Points& accumulated, const Points&
                                         const Config& config);
 std::optional<Bottom> track_bucket_bottom(const Bottom& learned, const Points& current,
                                           const Config& config);
+// expected_z narrows the search to a known bottom height; unset searches all heights.
 std::optional<Bottom> fit_bucket_shape(const Points& accumulated, const Points& current,
-                                       const Config& config);
+                                       const Config& config,
+                                       std::optional<double> expected_z = std::nullopt);
 std::optional<Bottom> track_bucket_shape(const Bottom& learned, const Points& current,
                                          const Config& config);
 enum class BottomMode { None = 0, Direct = 1, PlaneTracked = 2, BodyInferred = 3, ShapeFitted = 4 };
@@ -142,15 +177,28 @@ class Tracker {
   struct Frame {
     double stamp;
     Points body, upper;
+    bool grows_model{true};
+  };
+  struct Scan {
+    double stamp;
+    Points points;
+  };
+  struct PoseSample {
+    double stamp;
+    Pose pose;
   };
   struct LostModel {
+    std::optional<Eigen::Vector2d> anchor;
+    int anchor_hits{0};
     Points body;
     Pose pose;
-    Bottom bottom;
+    std::optional<Bottom> bottom;
     double body_stamp, bottom_stamp, attempt_stamp{-1}, pending_stamp{-1};
     unsigned int id;
     int hits{0};
     Pose pending_pose;
+    // When a cluster reappeared after the loss, or negative while none is in view.
+    double return_stamp{-1};
   };
   struct Reidentification {
     Cluster cluster;
@@ -165,10 +213,23 @@ class Tracker {
   Result missing(double stamp, const std::string& reason, Result result = Result{});
   void clear_model();
   void rebuild(double stamp);
+  Points accumulate_scans(const Points& current, double stamp);
+  void update_motion(double stamp);
+  void learn_clutter(const Points& points, double stamp);
+  bool is_clutter(const Point& p) const;
   Config cfg_;
   lidar_perception_system::SupportTracker acquisition_;
   std::vector<Eigen::Vector3d> exclusions_;
   std::deque<Frame> frames_;
+  std::deque<Scan> scans_;
+  std::deque<PoseSample> pose_history_;
+  struct ClutterCell {
+    double first_seen, last_seen;
+    long scans;
+  };
+  std::unordered_map<VoxelKey, ClutterCell, VoxelKeyHash> clutter_cells_;
+  std::unordered_set<VoxelKey, VoxelKeyHash> clutter_mask_;
+  double clutter_update_stamp_{0};
   Points selected_, accumulated_, reference_body_, reference_upper_;
   Pose pose_;
   Eigen::Vector2d body_velocity_{0, 0}, cluster_center_{0, 0};
@@ -186,7 +247,16 @@ class Tracker {
   double learned_bottom_stamp_{0};
   int bottom_hits_{0};
   bool bottom_pending_shape_{false};
-  double bottom_stamp_{0};
+  double bottom_stamp_{0}, bottom_search_stamp_{0}, mount_full_search_stamp_{0};
+  double recovery_sweep_stamp_{0};
+  int mount_conflict_hits_{0};
+  double mount_conflict_stamp_{0};
+  // Mean observed bucket position in the model frame. A partial chassis view lets the
+  // pose slide along a visible flat face, moving the mount only until the slide ends.
+  std::optional<Eigen::Vector2d> mount_anchor_;
+  int mount_anchor_hits_{0};
+  double mount_decay_stamp_{0};
+  Point mount_conflict_center_{0, 0, 0};
   Point position_{0, 0, 0}, measured_{0, 0, 0}, velocity_{0, 0, 0};
   double observation_stamp_{0}, variance_{1};
 };

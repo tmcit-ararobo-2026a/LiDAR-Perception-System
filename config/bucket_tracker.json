@@ -24,7 +24,7 @@
   },
   "registration": {
     "correspondence_m": 0.15, "max_registration_rmse": 0.05,
-    "min_overlap": 0.5, "min_support_spread_ratio": 0.1, "icp_iterations": 20
+    "min_overlap": 0.35, "min_support_spread_ratio": 0.1, "icp_iterations": 20, "yaw_prior_m2": 0.02
   },
   "opening": {
     "min_opening_z": 1.2, "max_opening_z": 2.1,
@@ -42,6 +42,7 @@
     "output_stationary_radius_m": 0.025,
     "sparse_shape_enabled": true,
     "shape_tracking_min_points": 3,
+    "search_interval_s": 0.1,
     "bucket_height": 0.255,
     "height_tolerance": 0.035,
     "min_radius": 0.075,
@@ -60,7 +61,11 @@
   "tracking": {
     "confirm_hits": 3, "max_prediction_s": 0.3,
     "reset_s": 2.0, "association_m": 0.65, "body_recovery_s": 2.0,
-    "reidentification_s": 15.0, "reidentification_m": 3.0
+    "reidentification_s": 15.0, "reidentification_m": 3.0,
+    "reidentification_speed": 1.5, "reidentify_hold_s": 0.3, "identify_extent_m": 0.45,
+    "scan_window_s": 0.1, "velocity_window_s": 0.4,
+    "clutter_learn_s": 3.0, "clutter_forget_s": 20.0,
+    "clutter_min_rate_hz": 2.0, "clutter_max_extent_m": 0.6
   },
   "tf_wait_s": 0.9,
   "queue_size": 12,

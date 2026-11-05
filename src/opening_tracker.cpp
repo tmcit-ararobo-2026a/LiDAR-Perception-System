@@ -17,18 +17,30 @@
 namespace lidar_perception_system::opening {
 namespace {
 constexpr double pi = 3.14159265358979323846;
-struct Key {
-  int x, y, z;
-  bool operator==(const Key& b) const { return x == b.x && y == b.y && z == b.z; }
-};
-struct Hash {
-  size_t operator()(const Key& k) const {
-    size_t h = std::hash<int>{}(k.x);
-    h ^= std::hash<int>{}(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<int>{}(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
+using Key = VoxelKey;
+using Hash = VoxelKeyHash;
+// Fixture mask resolution: fine in plan view so a passing robot loses few points.
+constexpr double clutter_xy = 0.15, clutter_z = 0.30;
+constexpr int model_growth_scans = 3;
+// Half the scan unmatched means a new face or a slipped pose; only a sound fit grows the model.
+constexpr double model_growth_min_overlap = .45;
+constexpr double model_growth_min_thickness_m = .05;
+// A short miss keeps the yaw seeds near the prediction; a longer one searches every heading.
+constexpr double recovery_sweep_after_s = .2;
+constexpr double recovery_sweep_interval_s = .1;
+constexpr double yaw_rate_deadband = 0.3;
+// Repeats of one contradicting bottom fit needed to replace a learned mount, each
+// within the window of the previous one.
+constexpr int mount_change_hits = 3;
+constexpr int mount_height_change_hits = 5;
+constexpr double mount_conflict_window_s = 3.;
+// An observed mount offset from the settled one is a pose sliding along a flat face.
+// It is believed while observed, and fades when not, because such slides end.
+constexpr int mount_anchor_min_hits = 3;
+constexpr int mount_anchor_max_hits = 20;
+constexpr double mount_offset_decay_s = 1.5;
+// Nothing is tracked until a first mount is found, so it is searched for more often.
+constexpr double unlearned_search_interval_s = .04;
 Key key(const Point& p, double size) {
   return {static_cast<int>(std::floor(p.x() / size)), static_cast<int>(std::floor(p.y() / size)),
           static_cast<int>(std::floor(p.z() / size))};
@@ -145,6 +157,16 @@ void Config::validate() const {
                    body_recovery_s,
                    reidentification_s,
                    reidentification_m,
+                   reidentification_speed,
+                   reidentify_hold_s,
+                   identify_extent_m,
+                   scan_window_s,
+                   velocity_window_s,
+                   yaw_prior_m2,
+                   clutter_learn_s,
+                   clutter_forget_s,
+                   clutter_min_rate_hz,
+                   clutter_max_extent_m,
                    association_m}) {
     if (!std::isfinite(v)) {
       throw std::invalid_argument("Opening config must be finite");
@@ -153,7 +175,8 @@ void Config::validate() const {
   for (double v :
        {bottom.bucket_height, bottom.height_tolerance, bottom.min_radius, bottom.max_radius,
         bottom.plane_distance, bottom.max_plane_rmse, bottom.max_tilt_rad, bottom.connection_m,
-        bottom.side_tolerance, bottom.min_side_span, bottom.max_body_inference_s}) {
+        bottom.side_tolerance, bottom.min_side_span, bottom.max_body_inference_s,
+        bottom.search_interval_s}) {
     if (!std::isfinite(v)) throw std::invalid_argument("Bottom config must be finite");
   }
   if (bottom.bucket_height < .1 || bottom.bucket_height > .5 || bottom.height_tolerance < 0 ||
@@ -166,7 +189,8 @@ void Config::validate() const {
       bottom.min_side_span > bottom.bucket_height || bottom.min_plane_points < 6 ||
       bottom.min_plane_points > max_model_points || bottom.min_current_points < 3 ||
       bottom.min_side_points < 3 || bottom.max_body_inference_s < 0 ||
-      bottom.max_body_inference_s > 10 || bottom.shape_tracking_min_points < 3 ||
+      bottom.max_body_inference_s > 10 || bottom.search_interval_s < 0 ||
+      bottom.search_interval_s > 1 || bottom.shape_tracking_min_points < 3 ||
       bottom.shape_tracking_min_points > max_model_points) {
     throw std::invalid_argument("Invalid bottom geometry bounds");
   }
@@ -189,7 +213,13 @@ void Config::validate() const {
       min_lip_width > max_residual || window_s <= 0 || window_s > 5 || prediction_s <= 0 ||
       prediction_s > reset_s || reset_s > 10 || body_recovery_s < 0 || body_recovery_s > reset_s ||
       reidentification_s < 0 || reidentification_s > 30 || reidentification_m <= 0 ||
-      reidentification_m > 10 ||
+      reidentification_m > 10 || reidentification_speed < 0 || reidentification_speed > 5 ||
+      reidentify_hold_s < 0 || reidentify_hold_s > 10 || identify_extent_m <= 0 ||
+      scan_window_s < 0 || scan_window_s > 0.5 ||
+      velocity_window_s <= 0 || velocity_window_s > 2 || yaw_prior_m2 < 0 || yaw_prior_m2 > 1 ||
+      clutter_learn_s < 0 || clutter_learn_s > 60 || clutter_forget_s <= 0 ||
+      clutter_forget_s > 600 || clutter_min_rate_hz < 0 || clutter_max_extent_m <= 0 ||
+      clutter_max_extent_m > 3 ||
       correspondence_m <= 0 || correspondence_m > 1 || max_registration_rmse <= 0 ||
       min_overlap <= 0 || min_overlap > 1 || association_m <= 0 || icp_iterations < 1 ||
       icp_iterations > 100 || ransac_iterations < 1 || ransac_iterations > 1000 ||
@@ -205,9 +235,14 @@ void Tracker::reset() {
   clear_model();
   lost_model_.reset();
   acquisition_.reset();
+  scans_.clear();
+  clutter_cells_.clear();
+  clutter_mask_.clear();
+  clutter_update_stamp_ = 0;
 }
 void Tracker::clear_model() {
   frames_.clear();
+  pose_history_.clear();
   selected_.clear();
   accumulated_.clear();
   reference_body_.clear();
@@ -225,6 +260,14 @@ void Tracker::clear_model() {
   bottom_hits_ = 0;
   bottom_pending_shape_ = false;
   bottom_stamp_ = 0;
+  bottom_search_stamp_ = 0;
+  mount_full_search_stamp_ = 0;
+  recovery_sweep_stamp_ = 0;
+  mount_conflict_hits_ = 0;
+  mount_conflict_stamp_ = 0;
+  mount_anchor_.reset();
+  mount_anchor_hits_ = 0;
+  mount_decay_stamp_ = 0;
   body_stamp_ = 0;
   acquired_stamp_ = 0;
   rejection_until_ = 0;
@@ -345,10 +388,30 @@ bool Tracker::register_body(const Points& input, const Pose& initial, Pose& outp
   if (reference.empty() || body.empty()) {
     return false;
   }
-  std::unordered_map<Key, std::vector<size_t>, Hash> hash;
-  for (size_t i = 0; i < reference.size(); ++i) {
-    hash[key(reference[i], cfg_.correspondence_m)].push_back(i);
+  // A dense grid keeps the nearest-neighbor search free of hashing. Its range is
+  // small because a robot model spans only a few correspondence cells.
+  const double cell_size = cfg_.correspondence_m;
+  Eigen::Vector3i grid_min = Eigen::Vector3i::Constant(std::numeric_limits<int>::max());
+  Eigen::Vector3i grid_max = Eigen::Vector3i::Constant(std::numeric_limits<int>::min());
+  const auto cell_of = [&](const Point& p) {
+    return Eigen::Vector3i(static_cast<int>(std::floor(p.x() / cell_size)),
+                           static_cast<int>(std::floor(p.y() / cell_size)),
+                           static_cast<int>(std::floor(p.z() / cell_size)));
+  };
+  for (const auto& p : reference) {
+    const Eigen::Vector3i cell = cell_of(p);
+    grid_min = grid_min.cwiseMin(cell);
+    grid_max = grid_max.cwiseMax(cell);
   }
+  const Eigen::Vector3i grid_size = grid_max - grid_min + Eigen::Vector3i::Ones();
+  std::vector<std::vector<size_t>> grid(static_cast<size_t>(grid_size.prod()));
+  const auto grid_index = [&](const Eigen::Vector3i& cell) -> int {
+    const Eigen::Vector3i offset = cell - grid_min;
+    if ((offset.array() < 0).any() || (offset.array() >= grid_size.array()).any()) return -1;
+    return offset.x() + grid_size.x() * (offset.y() + grid_size.y() * offset.z());
+  };
+  for (size_t i = 0; i < reference.size(); ++i)
+    grid[static_cast<size_t>(grid_index(cell_of(reference[i])))].push_back(i);
   Pose estimate = initial;
   struct Pair {
     Point p, q, map;
@@ -361,18 +424,16 @@ bool Tracker::register_body(const Points& input, const Pose& initial, Pose& outp
     std::vector<Pair> pairs;
     for (const auto& map : body) {
       const Point p = estimate.local(map);
-      const auto k = key(p, cfg_.correspondence_m);
+      const Eigen::Vector3i center_cell = cell_of(p);
       double best = cfg_.correspondence_m * cfg_.correspondence_m;
       const Point* q = nullptr;
       size_t reference_index = 0;
       for (int dx = -1; dx <= 1; ++dx) {
         for (int dy = -1; dy <= 1; ++dy) {
           for (int dz = -1; dz <= 1; ++dz) {
-            auto cell = hash.find({k.x + dx, k.y + dy, k.z + dz});
-            if (cell == hash.end()) {
-              continue;
-            }
-            for (size_t i : cell->second) {
+            const int index = grid_index(center_cell + Eigen::Vector3i(dx, dy, dz));
+            if (index < 0) continue;
+            for (size_t i : grid[static_cast<size_t>(index)]) {
               double d = (p - reference[i]).squaredNorm();
               if (d < best) {
                 best = d;
@@ -421,6 +482,14 @@ bool Tracker::register_body(const Points& input, const Pose& initial, Pose& outp
     if (iteration == cfg_.icp_iterations) {
       break;
     }
+    // A partial view constrains yaw weakly. Favor the predicted yaw so sparse
+    // scans cannot rotate the pose, while a real turn still outweighs the prior.
+    double pair_weight = 0;
+    for (const auto& pair : pairs)
+      pair_weight += std::min(1.0, 0.03 / std::max(1e-9, std::sqrt(pair.squared)));
+    const double yaw_prior = cfg_.yaw_prior_m2 * pair_weight;
+    h(2, 2) += yaw_prior;
+    g.z() -= yaw_prior * angle(estimate.yaw - initial.yaw);
     Point step = -h.ldlt().solve(g);
     if (!step.allFinite()) {
       return false;
@@ -434,7 +503,7 @@ bool Tracker::register_body(const Points& input, const Pose& initial, Pose& outp
     const Point new_origin = estimate.world(incremental.local(Point::Zero()));
     estimate.xy = new_origin.head<2>();
     estimate.yaw = angle(estimate.yaw - step.z());
-    if (step.norm() < 1e-5) {
+    if (step.norm() < 5e-4) {
       break;
     }
   }
@@ -685,10 +754,6 @@ void Tracker::rebuild(double stamp) {
   // never counts as a new opening observation, and it is removed by the reset
   // deadline.
   if (!body.empty()) {
-    // Preserve learned rigid geometry through partial visibility. New frames
-    // contain only unique, close registration support after acquisition.
-    if (identified_ || motion_seeded_)
-      body.insert(body.end(), reference_body_.begin(), reference_body_.end());
     body.erase(std::remove_if(body.begin(), body.end(),
                               [&](const Point& p) { return !cfg_.inside_field(pose_.world(p)); }),
                body.end());
@@ -700,7 +765,37 @@ void Tracker::rebuild(double stamp) {
                (p.head<2>() - learned_bottom_->center.head<2>()).norm() >= cfg_.max_radius + .04)
         upper_body.push_back(p);
     }
-    reference_body_ = voxelize(lower, cfg_.body_voxel, cfg_.max_body_points);
+    if ((identified_ || motion_seeded_) && !reference_body_.empty()) {
+      // An established model is an anchor: its points never move again. Averaging
+      // them with new poses lets small registration errors rotate the whole model
+      // relative to the robot, so only unoccupied voxels may still be added.
+      std::unordered_set<Key, Hash> occupied;
+      occupied.reserve(reference_body_.size() * 2);
+      for (const auto& p : reference_body_) occupied.insert(key(p, cfg_.body_voxel));
+      // A voxel joins the model only after several scans agree on it, so a stray
+      // return or a registration error does not become part of the anchor.
+      std::unordered_map<Key, int, Hash> scan_counts;
+      for (const auto& frame : frames_) {
+        if (!frame.grows_model) continue;
+        std::unordered_set<Key, Hash> in_frame;
+        for (const auto& p : frame.body)
+          if (p.z() <= cfg_.body_max_z) in_frame.insert(key(p, cfg_.body_voxel));
+        for (const auto& k : in_frame) ++scan_counts[k];
+      }
+      Points additions;
+      for (const auto& p : lower) {
+        const auto k = key(p, cfg_.body_voxel);
+        const auto count = scan_counts.find(k);
+        if (!occupied.count(k) && count != scan_counts.end() && count->second >= model_growth_scans)
+          additions.push_back(p);
+      }
+      const size_t room = static_cast<size_t>(cfg_.max_body_points) -
+                          std::min(static_cast<size_t>(cfg_.max_body_points), reference_body_.size());
+      additions = voxelize(additions, cfg_.body_voxel, room);
+      reference_body_.insert(reference_body_.end(), additions.begin(), additions.end());
+    } else {
+      reference_body_ = voxelize(lower, cfg_.body_voxel, cfg_.max_body_points);
+    }
     reference_upper_ =
         voxelize(upper_body, cfg_.body_voxel, std::min(500, cfg_.max_body_points / 4));
   } else {
@@ -711,19 +806,162 @@ void Tracker::rebuild(double stamp) {
               upper.end());
   accumulated_ = voxelize(upper, cfg_.opening_voxel, cfg_.max_model_points);
 }
+Points Tracker::accumulate_scans(const Points& current, double stamp) {
+  while (!scans_.empty() && stamp - scans_.front().stamp > cfg_.scan_window_s) scans_.pop_front();
+  Points merged = current;
+  for (const auto& scan : scans_) {
+    const double age = stamp - scan.stamp;
+    // Before a body is acquired there is no motion estimate. The window is short
+    // enough that its blur stays below the clustering resolution.
+    Pose past = pose_;
+    Pose present = pose_;
+    if (have_body_) {
+      present.xy += body_velocity_ * age;
+      present.yaw = angle(present.yaw + yaw_rate_ * age);
+    }
+    for (const auto& p : scan.points) merged.push_back(present.world(past.local(p)));
+  }
+  if (cfg_.scan_window_s > 0) scans_.push_back({stamp, current});
+  return merged;
+}
+void Tracker::learn_clutter(const Points& points, double stamp) {
+  if (cfg_.clutter_learn_s <= 0) return;
+  const auto cell_of = [&](const Point& p) {
+    return Key{static_cast<int>(std::floor(p.x() / clutter_xy)),
+               static_cast<int>(std::floor(p.y() / clutter_xy)),
+               static_cast<int>(std::floor(p.z() / clutter_z))};
+  };
+  // The tracked robot is not a fixture however long it stays in one place.
+  const bool tracked = have_body_ && !reference_body_.empty() && stamp - body_stamp_ < cfg_.prediction_s;
+  Eigen::Vector2d lo(0, 0), hi(0, 0);
+  if (tracked) {
+    lo = hi = reference_body_.front().head<2>();
+    for (const auto& p : reference_body_) {
+      lo = lo.cwiseMin(p.head<2>());
+      hi = hi.cwiseMax(p.head<2>());
+    }
+  }
+  std::unordered_set<Key, Hash> seen;
+  for (const auto& p : points) {
+    if (p.z() < cfg_.min_z || p.z() > cfg_.max_z) continue;
+    if (tracked) {
+      const auto local = pose_.local(p).head<2>().eval();
+      if ((local.array() >= lo.array() - .2).all() && (local.array() <= hi.array() + .2).all())
+        continue;
+    }
+    seen.insert(cell_of(p));
+  }
+  for (const auto& k : seen) {
+    auto [cell, created] = clutter_cells_.try_emplace(k, ClutterCell{stamp, stamp, 0});
+    (void)created;
+    cell->second.last_seen = stamp;
+    ++cell->second.scans;
+  }
+  if (stamp - clutter_update_stamp_ < .5 && stamp >= clutter_update_stamp_) return;
+  clutter_update_stamp_ = stamp;
+  // Forget a cell which stopped returning points: fixtures keep returning them.
+  for (auto it = clutter_cells_.begin(); it != clutter_cells_.end();) {
+    if (stamp - it->second.last_seen > cfg_.clutter_forget_s || stamp < it->second.last_seen)
+      it = clutter_cells_.erase(it);
+    else
+      ++it;
+  }
+  // Group persistent cells in plan view. A persistent blob as wide as a robot may
+  // be a robot standing still, so only small blobs are treated as fixtures.
+  std::unordered_map<Key, std::vector<Key>, Hash> columns;
+  for (const auto& [k, cell] : clutter_cells_) {
+    const double age = cell.last_seen - cell.first_seen;
+    if (age >= cfg_.clutter_learn_s && cell.scans / age >= cfg_.clutter_min_rate_hz)
+      columns[Key{k.x, k.y, 0}].push_back(k);
+  }
+  clutter_mask_.clear();
+  std::unordered_set<Key, Hash> visited;
+  for (const auto& [start, cells] : columns) {
+    if (!visited.insert(start).second) continue;
+    std::vector<Key> blob{start};
+    int min_x = start.x, max_x = start.x, min_y = start.y, max_y = start.y;
+    for (size_t i = 0; i < blob.size(); ++i) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        for (int dy = -1; dy <= 1; ++dy) {
+          const Key n{blob[i].x + dx, blob[i].y + dy, 0};
+          if (columns.count(n) && visited.insert(n).second) {
+            blob.push_back(n);
+            min_x = std::min(min_x, n.x);
+            max_x = std::max(max_x, n.x);
+            min_y = std::min(min_y, n.y);
+            max_y = std::max(max_y, n.y);
+          }
+        }
+      }
+    }
+    if ((max_x - min_x + 1) * clutter_xy > cfg_.clutter_max_extent_m ||
+        (max_y - min_y + 1) * clutter_xy > cfg_.clutter_max_extent_m)
+      continue;
+    for (const auto& column : blob)
+      for (const auto& k : columns.at(column)) clutter_mask_.insert(k);
+  }
+}
+bool Tracker::is_clutter(const Point& p) const {
+  return clutter_mask_.count(Key{static_cast<int>(std::floor(p.x() / clutter_xy)),
+                                 static_cast<int>(std::floor(p.y() / clutter_xy)),
+                                 static_cast<int>(std::floor(p.z() / clutter_z))}) > 0;
+}
+void Tracker::update_motion(double stamp) {
+  pose_history_.push_back({stamp, pose_});
+  while (!pose_history_.empty() && stamp - pose_history_.front().stamp > cfg_.velocity_window_s)
+    pose_history_.pop_front();
+  if (pose_history_.size() < 3 || stamp - pose_history_.front().stamp < .08) return;
+  // A least-squares slope suppresses the registration noise that a 20 ms pose
+  // difference would turn into several m/s of false velocity.
+  double mean_t = 0;
+  Eigen::Vector2d mean_xy = Eigen::Vector2d::Zero();
+  double mean_yaw = 0;
+  const double reference_yaw = pose_history_.back().pose.yaw;
+  std::vector<double> yaws;
+  yaws.reserve(pose_history_.size());
+  for (const auto& sample : pose_history_) {
+    const double yaw = angle(sample.pose.yaw - reference_yaw);
+    yaws.push_back(yaw);
+    mean_t += sample.stamp - stamp;
+    mean_xy += sample.pose.xy;
+    mean_yaw += yaw;
+  }
+  const double count = static_cast<double>(pose_history_.size());
+  mean_t /= count;
+  mean_xy /= count;
+  mean_yaw /= count;
+  double denominator = 0, yaw_slope = 0;
+  Eigen::Vector2d slope = Eigen::Vector2d::Zero();
+  size_t index = 0;
+  for (const auto& sample : pose_history_) {
+    const double t = sample.stamp - stamp - mean_t;
+    denominator += t * t;
+    slope += t * (sample.pose.xy - mean_xy);
+    yaw_slope += t * (yaws[index++] - mean_yaw);
+  }
+  if (denominator < 1e-9) return;
+  body_velocity_ = slope / denominator;
+  yaw_rate_ = yaw_slope / denominator;
+  const double speed = body_velocity_.norm();
+  if (speed > 3.) body_velocity_ *= 3. / speed;
+  yaw_rate_ = std::clamp(yaw_rate_, -3., 3.);
+  // Registration noise looks like a slow turn. Extrapolating it would drag the
+  // yaw prior along with it, so only a clear turn is carried into the prediction.
+  if (std::abs(yaw_rate_) < yaw_rate_deadband) yaw_rate_ = 0;
+}
 std::optional<Tracker::Reidentification> Tracker::reidentify(
     const std::vector<Cluster>& candidates, double stamp) {
   if (!lost_model_) return {};
   auto& lost = *lost_model_;
   if (stamp < lost.body_stamp || stamp - lost.body_stamp > cfg_.reidentification_s ||
-      (cfg_.bottom.max_body_inference_s > 0 &&
+      (lost.bottom && cfg_.bottom.max_body_inference_s > 0 &&
        stamp - lost.bottom_stamp > cfg_.bottom.max_body_inference_s)) {
     lost_model_.reset();
     return {};
   }
-  // Search the dormant template at most twice a second. A pending match is
-  // checked on each scan; no dormant pose or semantic anchor is published.
-  if (!lost.hits && stamp - lost.attempt_stamp < .5) return {};
+  // Bound the search rate. A pending match is checked on each scan; no dormant
+  // pose or semantic anchor is published.
+  if (!lost.hits && stamp - lost.attempt_stamp < .1) return {};
   lost.attempt_stamp = stamp;
   Tracker probe(cfg_);
   probe.reference_body_ = lost.body;
@@ -735,11 +973,14 @@ std::optional<Tracker::Reidentification> Tracker::reidentify(
     model_hi = model_hi.cwiseMax(p.head<2>());
   }
   center /= lost.body.size();
-  const auto required_support =
-      std::max({size_t{40}, static_cast<size_t>(cfg_.min_body_points), lost.body.size() / 8});
+  // One scan window shows only the visible faces, so support is not compared with
+  // the whole model. The opponent may have moved in the meantime.
+  const auto required_support = static_cast<size_t>(cfg_.min_body_points);
+  const double search_m =
+      cfg_.reidentification_m + cfg_.reidentification_speed * (stamp - lost.body_stamp);
   std::vector<const Cluster*> ranked;
   for (const auto& c : candidates)
-    if ((c.center - lost.pose.world(center).head<2>()).norm() <= cfg_.reidentification_m)
+    if ((c.center - lost.pose.world(center).head<2>()).norm() <= search_m)
       ranked.push_back(&c);
   std::sort(ranked.begin(), ranked.end(), [&](const Cluster* a, const Cluster* b) {
     return (a->center - lost.pose.world(center).head<2>()).squaredNorm() <
@@ -756,7 +997,8 @@ std::optional<Tracker::Reidentification> Tracker::reidentify(
     // A dormant model is not extrapolated using stale velocity. Search yaw
     // around a cluster centroid, then verify the actual rigid correspondences.
     if (!lost.hits)
-      for (int k = 0; k < 24; ++k) headings.push_back(lost.pose.yaw + k * pi / 12);
+      for (double turn : {0., .35, -.35, .7, -.7, 1.05, -1.05, 1.57, -1.57, 2.1, -2.1, pi})
+        headings.push_back(lost.pose.yaw + turn);
     for (double heading : headings) {
       Pose seed, fitted;
       seed.yaw = angle(heading);
@@ -764,9 +1006,8 @@ std::optional<Tracker::Reidentification> Tracker::reidentify(
       Points support;
       double rmse = 0, overlap = 0;
       if (!probe.register_body(c.body, seed, fitted, rmse, overlap, &support) ||
-          !body_size_valid(support) || overlap < std::max(.60, cfg_.min_overlap) ||
-          support.size() < required_support ||
-          (fitted.xy - lost.pose.xy).norm() > cfg_.reidentification_m)
+          !body_size_valid(support) || overlap < std::max(.45, cfg_.min_overlap) ||
+          support.size() < required_support || (fitted.xy - lost.pose.xy).norm() > search_m)
         continue;
       Eigen::Vector2d lo = fitted.local(support.front()).head<2>(), hi = lo;
       for (const auto& p : support) {
@@ -774,7 +1015,7 @@ std::optional<Tracker::Reidentification> Tracker::reidentify(
         lo = lo.cwiseMin(q);
         hi = hi.cwiseMax(q);
       }
-      if (((hi - lo).array() < .5 * (model_hi - model_lo).array()).any()) continue;
+      if ((hi - lo).maxCoeff() < .3 * (model_hi - model_lo).maxCoeff()) continue;
       const double coverage = static_cast<double>(support.size()) / lost.body.size();
       const double quality = rmse + cfg_.max_registration_rmse * (2 - overlap - coverage);
       const bool different = best && ((best->pose.xy - fitted.xy).norm() > .15 ||
@@ -862,10 +1103,10 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     // reset interval after the model times out.
     const bool reject =
         unconfirmed_timeout && !height_pending_ && stamp - body_stamp_ <= cfg_.prediction_s;
-    if (identified_ && learned_bottom_ && cfg_.reidentification_s > cfg_.reset_s &&
-        !reference_body_.empty()) {
-      lost_model_ = LostModel{reference_body_, pose_, *learned_bottom_, body_stamp_,
-                             learned_bottom_stamp_, -1, -1, track_id_, 0, Pose{}};
+    if (identified_ && cfg_.reidentification_s > cfg_.reset_s && !reference_body_.empty()) {
+      lost_model_ = LostModel{mount_anchor_, mount_anchor_hits_, reference_body_, pose_,
+                              learned_bottom_, body_stamp_, learned_bottom_stamp_, -1, -1,
+                              track_id_, 0, Pose{}};
     }
     clear_model();
     if (reject) {
@@ -890,7 +1131,14 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   for (const auto& p : map_points) {
     if (accepted(p) && accepted_index++ % stride == 0) filtered.push_back(p);
   }
-  auto candidates = clusters(filtered);
+  learn_clutter(filtered, stamp);
+  if (!clutter_mask_.empty()) {
+    filtered.erase(std::remove_if(filtered.begin(), filtered.end(),
+                                  [&](const Point& p) { return is_clutter(p); }),
+                   filtered.end());
+  }
+  const Points window = accumulate_scans(filtered, stamp);
+  auto candidates = clusters(window);
   auto reidentified = reidentify(candidates, stamp);
   const double elapsed = have_body_ ? stamp - body_stamp_ : 0;
   std::vector<lidar_perception_system::SupportCandidate> hypotheses;
@@ -924,7 +1172,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     tracked.center.setZero();
     tracked.min_x = tracked.min_y = std::numeric_limits<double>::infinity();
     tracked.max_x = tracked.max_y = -tracked.min_x;
-    for (const auto& p : filtered) {
+    for (const auto& p : window) {
       const Point local = predicted.local(p);
       const Point last_local = pose_.local(p);
       const auto inside = [&](const Point& v) {
@@ -988,7 +1236,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     ++eligible;
     int upper = 0;
     Points upper_context;
-    for (const auto& p : filtered) {
+    for (const auto& p : window) {
       if (p.z() >= cfg_.min_opening_z - cfg_.bottom.bucket_height - cfg_.bottom.height_tolerance &&
           p.x() > c.min_x - cfg_.crop_margin && p.x() < c.max_x + cfg_.crop_margin &&
           p.y() > c.min_y - cfg_.crop_margin && p.y() < c.max_y + cfg_.crop_margin) {
@@ -1033,6 +1281,19 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
   }
   if (reidentified) chosen = &reidentified->cluster;
+  // The same robot usually returns within moments. Starting a new empty track at
+  // once would discard the learned model and its mounting geometry.
+  if (!have_body_ && lost_model_) {
+    if (candidates.empty()) {
+      lost_model_->return_stamp = -1;
+    } else if (lost_model_->return_stamp < 0) {
+      lost_model_->return_stamp = stamp;
+    }
+    if (!reidentified && !candidates.empty() &&
+        stamp - lost_model_->return_stamp < cfg_.reidentify_hold_s) {
+      return missing(stamp, "reidentifying robot", result);
+    }
+  }
   if (!chosen) {
     if (!confirmed_) {
       hits_ = 0;
@@ -1044,14 +1305,16 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     return missing(stamp, "ambiguous robot clusters", result);
   }
   Pose updated;
-  Points supported_body;
+  Points supported_body, unsupported_lower;
   if (reidentified) {
     const auto recovered = *lost_model_;
     clear_model();
     input_stamp_ = stamp;
     reference_body_ = recovered.body;
     learned_bottom_ = recovered.bottom;
-    learned_bottom_stamp_ = recovered.bottom_stamp;
+    learned_bottom_stamp_ = recovered.bottom ? recovered.bottom_stamp : 0;
+    mount_anchor_ = recovered.anchor;
+    mount_anchor_hits_ = recovered.anchor_hits;
     pose_ = updated = reidentified->pose;
     have_body_ = identified_ = true;
     acquired_stamp_ = stamp;
@@ -1075,10 +1338,13 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     initial.yaw = angle(initial.yaw + yaw_rate_ * elapsed);
     bool registered = register_body(chosen->body, initial, updated, result.registration_rmse,
                                     result.overlap, &supported_body);
+    // A well supported primary fit needs no alternate seeds. They exist for a
+    // doubtful match, and every extra registration adds latency to each scan.
+    const bool primary_sound = registered && result.overlap >= .8;
     // At a wall the chassis may stop or turn abruptly. A velocity seed alone
     // can slip one repeating chassis feature ahead of the current returns.
-    if ((initial.xy - pose_.xy).norm() > cfg_.body_voxel * .2 ||
-        std::abs(angle(initial.yaw - pose_.yaw)) > .01) {
+    if (!primary_sound && ((initial.xy - pose_.xy).norm() > cfg_.body_voxel * .2 ||
+                           std::abs(angle(initial.yaw - pose_.yaw)) > .01)) {
       Pose fitted;
       Points support;
       double rmse = 0, overlap = 0;
@@ -1113,7 +1379,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     observed_center /= std::max(size_t{1}, observed_lower);
     const Eigen::Vector2d correction =
         (observed_center - initial.world(reference_center)).head<2>();
-    if (correction.norm() > cfg_.body_voxel * .2 && correction.norm() < cfg_.correspondence_m) {
+    if (!primary_sound && correction.norm() > cfg_.body_voxel * .2 &&
+        correction.norm() < cfg_.correspondence_m) {
       Pose alternate = initial, fitted;
       alternate.xy += correction;
       double rmse = 0, overlap = 0;
@@ -1130,8 +1397,9 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       }
     }
     if (observed_lower < static_cast<size_t>(cfg_.min_body_points)) registered = false;
-    if ((!registered ||
-         (!result.body_upper_assisted && supported_body.size() < .7 * lower_reference.size())) &&
+    // Compare support with the observed returns: a scan sees only part of the
+    // model, so a small share of the model is the normal case and not a failure.
+    if ((!registered || (!result.body_upper_assisted && supported_body.size() < .5 * observed_lower)) &&
         elapsed <= cfg_.body_recovery_s) {
       // Never reacquire from a centroid alone: each seed must pass the same
       // unique correspondences, residual, overlap and 2D-shape checks as ICP.
@@ -1152,6 +1420,10 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
                      : std::numeric_limits<double>::infinity();
       bool ambiguous = false;
       const size_t limit = std::min(size_t{3}, ranked.size());
+      const bool sweep_headings = elapsed >= recovery_sweep_after_s &&
+                                  (stamp - recovery_sweep_stamp_ >= recovery_sweep_interval_s ||
+                                   stamp < recovery_sweep_stamp_);
+      if (sweep_headings) recovery_sweep_stamp_ = stamp;
       const auto principal_heading = [](const Points& points) -> std::optional<double> {
         Eigen::Vector2d mean = Eigen::Vector2d::Zero();
         for (const auto& p : points) mean += p.head<2>();
@@ -1188,6 +1460,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
           turns.push_back(-.175);
           turns.push_back(.175);
         }
+        if (sweep_headings)
+          for (double turn : {.7, -.7, 1.05, -1.05, 1.57, -1.57, 2.1, -2.1, pi}) turns.push_back(turn);
         for (double turn : turns) {
           Pose seed = initial, fitted;
           seed.yaw = angle(seed.yaw + turn);
@@ -1285,16 +1559,32 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       }
       return missing(stamp, "robot registration rejected", result);
     }
+    unsupported_lower.clear();
+    {
+      // Returns next to the registered model may be a face not seen before. They
+      // are offered to the model; rebuild() keeps those which later scans repeat.
+      std::unordered_set<Key, Hash> supported_keys;
+      for (const auto& p : supported_body) supported_keys.insert(key(p, cfg_.body_voxel));
+      for (const auto& p : chosen->body)
+        if (p.z() <= cfg_.body_max_z && !supported_keys.count(key(p, cfg_.body_voxel)))
+          unsupported_lower.push_back(p);
+    }
     chosen->body = std::move(supported_body);
     if (!body_size_valid(chosen->body))
       return missing(stamp, "robot body exceeds size envelope", result);
-    if (elapsed > 0) {
-      const auto v = (updated.xy - pose_.xy) / elapsed;
-      body_velocity_ = 0.5 * body_velocity_ + 0.5 * v;
-      yaw_rate_ = 0.5 * yaw_rate_ + 0.5 * angle(updated.yaw - pose_.yaw) / elapsed;
-    }
   }
   pose_ = updated;
+  update_motion(stamp);
+  // Fixtures were masked or are too small. A clearly robot-sized model is the
+  // opponent even while it stands still, so it needs no motion evidence.
+  if (!identified_ && have_body_ && !reference_body_.empty()) {
+    Eigen::Vector2d model_lo = reference_body_.front().head<2>(), model_hi = model_lo;
+    for (const auto& p : reference_body_) {
+      model_lo = model_lo.cwiseMin(p.head<2>());
+      model_hi = model_hi.cwiseMax(p.head<2>());
+    }
+    if ((model_hi - model_lo).maxCoeff() >= cfg_.identify_extent_m) identified_ = true;
+  }
   motion_seeded_ = motion_seeded_ || chosen_motion;
   body_stamp_ = stamp;
   cluster_center_ = pose_.xy;
@@ -1324,7 +1614,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
   }
   upper = voxelize(upper, cfg_.opening_voxel, cfg_.max_model_points);
-  auto instantaneous = fit_opening(upper, upper);
+  // Only compared with a known opening below, so skip the fit without one.
+  const auto instantaneous = last_opening_ ? fit_opening(upper, upper) : std::nullopt;
   if (instantaneous && last_opening_ &&
       std::abs(instantaneous->center.z() - last_opening_->center.z()) > cfg_.height_change_m) {
     for (auto& frame : frames_) {
@@ -1340,6 +1631,32 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   Frame frame;
   frame.stamp = stamp;
   frame.body = local_points(chosen->body, pose_);
+  frame.grows_model = result.overlap >= model_growth_min_overlap;
+  if (frame.grows_model && chosen->body.size() >= 3) {
+    // One flat face leaves the pose free to slide along it, and points added at a
+    // slid pose lengthen that face, which then slides further.
+    Eigen::Vector2d mean = Eigen::Vector2d::Zero();
+    for (const auto& p : chosen->body) mean += p.head<2>();
+    mean /= chosen->body.size();
+    Eigen::Matrix2d covariance = Eigen::Matrix2d::Zero();
+    for (const auto& p : chosen->body) {
+      const Eigen::Vector2d delta = p.head<2>() - mean;
+      covariance += delta * delta.transpose();
+    }
+    covariance /= chosen->body.size();
+    frame.grows_model =
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(covariance).eigenvalues()[0] >=
+        model_growth_min_thickness_m * model_growth_min_thickness_m;
+  }
+  {
+    const double limit = std::sqrt(2.) * (cfg_.max_body_side + cfg_.body_size_tolerance);
+    for (const auto& p : unsupported_lower) {
+      const Point local = pose_.local(p);
+      const Eigen::Vector2d grown_lo = lo.head<2>().cwiseMin(local.head<2>());
+      const Eigen::Vector2d grown_hi = hi.head<2>().cwiseMax(local.head<2>());
+      if ((grown_hi - grown_lo).norm() <= limit) frame.body.push_back(local);
+    }
+  }
   // Learn upper rigid features only while the lower chassis independently
   // supports the pose. Never grow a new upper model from upper-only alignment.
   const auto lower_support =
@@ -1369,12 +1686,66 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     frames_.pop_front();
   }
   rebuild(stamp);
+  // The full height range is searched rarely: it is the most expensive step and
+  // the mount height rarely changes. A contradiction is followed at the fast rate.
+  const bool full_search = !learned_bottom_ || stamp >= mount_full_search_stamp_ ||
+                           stamp < bottom_search_stamp_ || mount_conflict_hits_ > 0;
   const auto detect_bottom = [&]() {
     auto measured = fit_bucket_bottom(accumulated_, upper, cfg_);
     if (measured) return std::make_pair(measured, false);
-    return std::make_pair(fit_bucket_shape(accumulated_, upper, cfg_), true);
+    const std::optional<double> expected_z =
+        !full_search && learned_bottom_ ? std::optional<double>(learned_bottom_->center.z())
+                                        : std::nullopt;
+    return std::make_pair(fit_bucket_shape(accumulated_, upper, cfg_, expected_z), true);
   };
-  auto [bottom, shape_fitted] = detect_bottom();
+  // A learned mount is followed on every scan below, so searching for it on each
+  // scan as well would add only latency.
+  std::optional<Bottom> bottom;
+  bool shape_fitted = false;
+  const double search_interval = learned_bottom_ ? cfg_.bottom.search_interval_s
+                                                 : std::min(cfg_.bottom.search_interval_s,
+                                                            unlearned_search_interval_s);
+  if (stamp - bottom_search_stamp_ >= search_interval || stamp < bottom_search_stamp_) {
+    bottom_search_stamp_ = stamp;
+    if (full_search) mount_full_search_stamp_ = stamp + 1.0;
+    std::tie(bottom, shape_fitted) = detect_bottom();
+  }
+  // Another horizontal disk on the robot can pass one fit (a mascot's head did).
+  // Keep the learned mount unless the same contradicting fit repeats, because a
+  // wrong mount would otherwise persist in every body-inferred position. Fits are
+  // sparse at long range, so failed searches between repeats do not clear them.
+  if (mount_conflict_hits_ > 0 && (stamp < mount_conflict_stamp_ ||
+                                   stamp - mount_conflict_stamp_ > mount_conflict_window_s))
+    mount_conflict_hits_ = 0;
+  if (bottom && learned_bottom_) {
+    const bool height_differs =
+        std::abs(bottom->center.z() - learned_bottom_->center.z()) > cfg_.height_change_m;
+    const bool contradicts =
+        (bottom->center.head<2>() - learned_bottom_->center.head<2>()).norm() > .12 || height_differs;
+    if (!contradicts) {
+      mount_conflict_hits_ = 0;
+    } else {
+      const bool same = mount_conflict_hits_ > 0 &&
+                        (bottom->center - mount_conflict_center_).norm() < .08;
+      mount_conflict_hits_ = same ? mount_conflict_hits_ + 1 : 1;
+      mount_conflict_center_ = bottom->center;
+      mount_conflict_stamp_ = stamp;
+      // A disk at another height is the known false fit, so it needs more repeats.
+      if (mount_conflict_hits_ < (height_differs ? mount_height_change_hits : mount_change_hits)) {
+        bottom.reset();
+      } else {
+        // The repeats already confirmed this fit.
+        mount_anchor_.reset();
+        mount_anchor_hits_ = 0;
+        learned_bottom_ = bottom;
+        learned_bottom_stamp_ = stamp;
+        last_bottom_ = bottom;
+        bottom_stamp_ = stamp;
+        bottom_hits_ = cfg_.confirm_hits;
+        mount_conflict_hits_ = 0;
+      }
+    }
+  }
   if (bottom && !cfg_.inside_field(pose_.world(bottom->center))) bottom.reset();
   if (bottom && last_bottom_ &&
       std::abs(bottom->center.z() - last_bottom_->center.z()) > cfg_.height_change_m) {
@@ -1409,6 +1780,14 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       learned_bottom_ = bottom;
       learned_bottom_stamp_ = stamp;
       result.bottom_tracking_mode = shape_fitted ? BottomMode::ShapeFitted : BottomMode::Direct;
+      // The mean freezes once settled, so a later slide cannot move the reference.
+      if (mount_anchor_hits_ < mount_anchor_max_hits) {
+        const Eigen::Vector2d seen = bottom->center.head<2>();
+        mount_anchor_ = mount_anchor_
+                            ? Eigen::Vector2d(*mount_anchor_ + (seen - *mount_anchor_) / (mount_anchor_hits_ + 1))
+                            : seen;
+        ++mount_anchor_hits_;
+      }
     }
   } else {
     // Sparse scans may provide side evidence between two floor observations.
@@ -1433,11 +1812,18 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       result.bottom_tracking_mode = BottomMode::ShapeFitted;
     } else if (!bottom ||
                (bottom->center - learned_bottom_->center).norm() <= cfg_.height_change_m) {
+      if (mount_anchor_ && mount_anchor_hits_ >= mount_anchor_min_hits) {
+        const double dt = std::clamp(stamp - mount_decay_stamp_, 0., .1);
+        learned_bottom_->center.head<2>() =
+            *mount_anchor_ + std::exp(-dt / mount_offset_decay_s) *
+                                 (learned_bottom_->center.head<2>() - *mount_anchor_);
+      }
       result.bottom_tracking_mode = BottomMode::BodyInferred;
     }
     // An unconfirmed contradictory candidate suppresses this frame, but must
     // not erase a recognized mount. Replace the anchor only after confirmation.
   }
+  mount_decay_stamp_ = stamp;
   if (learned_bottom_ && result.bottom_tracking_mode != BottomMode::None &&
       cfg_.inside_field(pose_.world(learned_bottom_->center))) {
     result.tracked_bottom = learned_bottom_;

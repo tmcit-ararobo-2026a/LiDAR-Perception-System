@@ -96,6 +96,26 @@ ros2 launch lidar_perception_system bucket_tracker.launch.py start_zone:=red
 
 別のJSONを使う場合は、各launchに `config_file:=/absolute/path/to/config.json` を追加します。
 
+### 追跡の調整項目
+
+相手ロボットの追跡を調整する主な項目です。
+
+| 項目 | 既定値 | 内容 |
+|---|---|---|
+| `tracking.scan_window_s` | 0.1 | 運動補償して重ねる直近スキャンの時間（秒）。0で無効 |
+| `tracking.velocity_window_s` | 0.4 | 速度とヨーレートの推定に使う姿勢履歴の長さ（秒） |
+| `tracking.reidentification_speed` | 1.5 | 見失っている間に再ロック探索半径を広げる速さ（m/s） |
+| `tracking.reidentify_hold_s` | 0.3 | クラスタが再び見えてから、新規トラックを始めず再ロックを優先する時間（秒） |
+| `tracking.identify_extent_m` | 0.45 | この幅以上のモデルは、動かなくても相手ロボットと判定する（m） |
+| `tracking.clutter_learn_s` | 3.0 | 地図にない小さな静止物とみなして除外するまでの時間（秒）。0で無効 |
+| `tracking.clutter_forget_s` | 20.0 | 除外した静止物を忘れるまでの時間（秒） |
+| `tracking.clutter_min_rate_hz` | 2.0 | 静止物とみなす最低の点検出頻度（Hz） |
+| `tracking.clutter_max_extent_m` | 0.6 | 静止物として除外する最大の大きさ（m）。ロボットより小さくしてください |
+| `registration.yaw_prior_m2` | 0.02 | ICPで予測ヨーを優先する重み（レバー長の2乗、m²）。大きいと実際の旋回に遅れる |
+| `bottom.search_interval_s` | 0.1 | 底面の全探索の間隔（秒）。学習済みの底面は毎スキャン追跡する |
+
+処理負荷を抑えるため底面の全探索は間引いているので、`/bucket_opening_tracker/bottom` の更新頻度は `search_interval_s` で頭打ちになります。毎スキャンの位置が必要な場合は `/bucket_opening_tracker/bottom_track` を使ってください。
+
 ## 出力
 
 ノード・launch名は整理しましたが、既存のトピック名・メッセージ型・TF名は維持しています。

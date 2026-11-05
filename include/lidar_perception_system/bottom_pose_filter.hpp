@@ -51,6 +51,7 @@ class BottomPoseFilter {
       xy_observations_.clear();
       if (xy_observed) xy_observations_.emplace_back(stamp, center);
       inferred_motion_hits_ = 0;
+      diverged_hits_ = 0;
     } else {
       observations_.emplace_back(stamp, center);
       while (observations_.size() > 100 ||
@@ -124,6 +125,26 @@ class BottomPoseFilter {
       // Bound a single registration/shape correction. Velocity prediction
       // carries actual translation; repeated evidence can still correct drift.
       const double xy = residual.head<2>().norm();
+      // One outlier is bounded below, but a persistent gap means the filter state
+      // is wrong: without this it could stay a metre behind a good measurement.
+      diverged_hits_ = xy > diverged_residual_m ? diverged_hits_ + 1 : 0;
+      if (diverged_hits_ >= diverged_scans) {
+        diverged_hits_ = 0;
+        center_.head<2>() = center.head<2>();
+        output_xy_ = center.head<2>();
+        velocity_.head<2>() = recent.count >= 4 ? Eigen::Vector2d(recent.velocity.head<2>())
+                                                : Eigen::Vector2d(Eigen::Vector2d::Zero());
+        output_velocity_ = velocity_.head<2>();
+        stationary_ = false;
+        center_.z() = height_changed ? center.z() : previous_height;
+        ready_ = true;
+        id_ = id;
+        stamp_ = stamp;
+        center.head<2>() = output_xy_;
+        center.z() = center_.z();
+        normal = normal_;
+        return;
+      }
       if (xy > .06) residual.head<2>() *= .06 / xy;
       if (hold_xy) residual.head<2>().setZero();
       residual.z() = std::clamp(residual.z(), -.015, .015);
@@ -213,6 +234,9 @@ class BottomPoseFilter {
     result.velocity /= std::max(denominator, 1e-9);
     return result;
   }
+  static constexpr double diverged_residual_m = .15;
+  static constexpr int diverged_scans = 3;
+  int diverged_hits_{0};
   double tau_, max_acceleration_, stationary_radius_, stamp_{0};
   uint32_t id_{0};
   bool ready_{false};

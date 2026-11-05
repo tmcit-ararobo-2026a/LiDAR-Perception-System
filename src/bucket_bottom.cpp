@@ -486,6 +486,16 @@ std::optional<Bottom> fit_sparse_patch(const Points &plane, const Points &all,
     return {};
   for (const auto &p : current)
     fresh.push_back(axis.local(p));
+  // Refinement cost grows with the wall returns; a bounded sample keeps its
+  // accuracy. The final evidence below still counts every accumulated point.
+  constexpr size_t max_refine_points = 150;
+  if (side.size() > max_refine_points) {
+    Points sampled;
+    sampled.reserve(max_refine_points);
+    for (size_t i = 0; i < max_refine_points; ++i)
+      sampled.push_back(side[i * side.size() / max_refine_points]);
+    side = std::move(sampled);
+  }
   std::optional<Bottom> best;
   std::mt19937 rng(0x20261026);
   for (int ri = 0; ri <= 6; ++ri) {
@@ -563,7 +573,8 @@ std::optional<Bottom> fit_sparse_patch(const Points &plane, const Points &all,
 
 std::optional<Bottom> fit_bucket_shape(const Points &accumulated,
                                        const Points &current,
-                                       const Config &cfg) {
+                                       const Config &cfg,
+                                       std::optional<double> expected_z) {
   cfg.validate();
   if (!cfg.bottom.sparse_shape_enabled || current.empty() ||
       current.size() > static_cast<size_t>(cfg.max_model_points) ||
@@ -577,10 +588,14 @@ std::optional<Bottom> fit_bucket_shape(const Points &accumulated,
     if (p.allFinite() && p.cwiseAbs().maxCoeff() <= 200)
       fresh.push_back(p);
   std::vector<Bottom> candidates;
-  const double lower = cfg.min_opening_z - cfg.bottom.bucket_height -
-                       cfg.bottom.height_tolerance;
-  const double upper = cfg.max_opening_z - cfg.bottom.bucket_height +
-                       cfg.bottom.height_tolerance;
+  double lower = cfg.min_opening_z - cfg.bottom.bucket_height -
+                 cfg.bottom.height_tolerance;
+  double upper = cfg.max_opening_z - cfg.bottom.bucket_height +
+                 cfg.bottom.height_tolerance;
+  if (expected_z) {
+    lower = std::max(lower, *expected_z - cfg.height_change_m);
+    upper = std::min(upper, *expected_z + cfg.height_change_m);
+  }
   for (double z = lower; z <= upper; z += cfg.bottom.plane_distance) {
     Points slice;
     for (const auto &p : finite)
