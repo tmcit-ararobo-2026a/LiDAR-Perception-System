@@ -67,7 +67,7 @@
     "clutter_learn_s": 3.0, "clutter_forget_s": 20.0,
     "clutter_min_rate_hz": 2.0, "clutter_max_extent_m": 0.6
   },
-  "tf_wait_s": 0.9,
+  "tf_wait_s": 0.1,
   "queue_size": 12,
   "max_input_bytes": 8388608,
   "publish_tf": false
