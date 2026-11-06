@@ -45,12 +45,13 @@ constexpr double unlearned_search_interval_s = .04;
 constexpr double top_frame_jump_rad = .35;
 // Share of the difference a top fit corrects in a known mount at each fit.
 constexpr double top_mount_gain_resting = .5, top_mount_gain_moving = .1;
-// How quickly the floor height follows the rim: slowly, and quickly once this many fits in a
-// row disagree with it by this much on the same side.
-constexpr double top_floor_slow_s = 2., top_floor_fast_s = .25, top_floor_trend_m = .03;
-constexpr int top_floor_trend_fits = 3;
-// A rim this close to a learned floor without a measured plane updates its height.
-constexpr double top_floor_follow_m = .10;
+// Returns this far from the bucket axis can belong to the rim, given the wander of the pose.
+constexpr double rim_axis_margin_m = .08;
+// Scatter of a return's height: proportional to range, from the sensor's angular precision.
+constexpr double rim_height_noise_per_m = .0023, rim_height_noise_min_m = .005;
+// Republished scan windows repeat returns for this long, and only new ones count.
+constexpr double rim_repeat_s = .15;
+constexpr double rim_repeat_voxel_m = .01;
 // How far a floor fit may be from the height implied by the rim (metres).
 constexpr double rim_height_tolerance_m = .08;
 // A robot whose pose stays this close to its mean over the window is taken to be standing still.
@@ -269,7 +270,13 @@ void Config::validate() const {
     throw std::invalid_argument("Invalid opening tracker bounds or limits");
   }
 }
-Tracker::Tracker(Config config) : cfg_(config) { cfg_.validate(); }
+Tracker::Tracker(Config config)
+    : cfg_(config),
+      // The rulebook range, with room for the scatter of returns at its ends.
+      rim_filter_(config.min_opening_z - config.bottom.height_tolerance,
+                  config.max_opening_z + config.bottom.height_tolerance + .05) {
+  cfg_.validate();
+}
 void Tracker::reset() {
   clear_model();
   lost_model_.reset();
@@ -284,9 +291,8 @@ void Tracker::clear_model() {
   top_scans_.clear();
   top_ceilings_.clear();
   top_poses_.clear();
-  top_floor_.reset();
-  top_floor_stamp_ = 0;
-  top_floor_trend_ = top_floor_side_ = 0;
+  rim_filter_.clear();
+  rim_recent_.clear();
   pose_history_.clear();
   selected_.clear();
   accumulated_.clear();
@@ -858,7 +864,8 @@ void Tracker::remember_top_scan(const Points& upper, double stamp) {
     top_ceilings_.pop_front();
   while (!top_poses_.empty() && stamp - top_poses_.front().stamp > window) top_poses_.pop_front();
   top_scans_.push_back({stamp, upper});
-  top_poses_.push_back({stamp, pose_});
+  top_poses_.push_back(
+      {stamp, pose_, rim_filter_.ready() ? std::optional<double>(rim_filter_.rim()) : std::nullopt});
   size_t total = 0;
   for (const auto& scan : top_scans_) total += scan.points.size();
   // A near robot returns far more than the fit needs. The newest scans matter most.
@@ -912,11 +919,7 @@ std::optional<Bottom> Tracker::fit_top(double stamp, const Eigen::Vector2d& sens
   context.stamp = stamp;
   context.sigma = std::max(cfg_.bottom.top_noise_min_m,
                            cfg_.bottom.top_noise_per_m * (pose_.xy - sensor_xy).norm());
-  // A measured floor plane is the best height. Otherwise the rim height of many fits is, since
-  // one fit can be off by a few centimetres and would otherwise stay learned.
-  if (learned_bottom_) context.expected_floor_z = learned_bottom_->center.z();
-  if (top_floor_ && !(learned_bottom_ && learned_bottom_->plane_points >= cfg_.bottom.min_plane_points))
-    context.expected_floor_z = *top_floor_;
+  if (rim_filter_.ready()) context.expected_floor_z = rim_filter_.rim() - cfg_.bottom.bucket_height;
   // Without a known view the top is taken at face value.
   if (sensor_view_) {
     double ceiling = -std::numeric_limits<double>::infinity();
@@ -933,38 +936,56 @@ std::optional<Bottom> Tracker::fit_top(double stamp, const Eigen::Vector2d& sens
   }
   const auto resting = resting_pose();
   std::optional<Bottom> bottom;
-  if (!resting || top_poses_.size() != top_scans_.size()) {
+  if (top_poses_.size() != top_scans_.size()) {
     bottom = fit_bucket_top(top_scans_, context, cfg_, stats);
   } else {
-    // The robot stands still, so its returns stay where they were measured.
+    // A standing robot's returns stay where they were measured, and a lifting bucket's returns
+    // are brought to its present height. That lets the whole window describe the bucket as it is.
     std::deque<TimedPoints> steady;
     for (size_t i = 0; i < top_scans_.size(); ++i) {
       TimedPoints scan;
       scan.stamp = top_scans_[i].stamp;
+      const double lift = rim_filter_.ready() && top_poses_[i].rim
+                              ? rim_filter_.rim() - *top_poses_[i].rim
+                              : 0.;
       scan.points.reserve(top_scans_[i].points.size());
-      for (const auto& p : top_scans_[i].points)
-        scan.points.push_back(resting->local(top_poses_[i].pose.world(p)));
+      for (auto p : top_scans_[i].points) {
+        if (resting) p = resting->local(top_poses_[i].pose.world(p));
+        p.z() += lift;
+        scan.points.push_back(p);
+      }
       steady.push_back(std::move(scan));
     }
     bottom = fit_bucket_top(steady, context, cfg_, stats);
-    if (bottom) bottom->center = pose_.local(resting->world(bottom->center));
-  }
-  if (stats && stats->seen_floor_z) {
-    if (!top_floor_) {
-      if (bottom) top_floor_ = stats->seen_floor_z;
-    } else {
-      // One sparse rim is noisy, so the height moves slowly until rims keep disagreeing with it
-      // on the same side. That is a lift, which it then follows quickly.
-      const double innovation = *stats->seen_floor_z - *top_floor_;
-      const int side = std::abs(innovation) > top_floor_trend_m ? (innovation > 0 ? 1 : -1) : 0;
-      top_floor_trend_ = side != 0 && side == top_floor_side_ ? top_floor_trend_ + 1 : 0;
-      top_floor_side_ = side;
-      const double tau = top_floor_trend_ >= top_floor_trend_fits ? top_floor_fast_s : top_floor_slow_s;
-      *top_floor_ += (1 - std::exp(-std::max(stamp - top_floor_stamp_, 0.) / tau)) * innovation;
-    }
-    top_floor_stamp_ = stamp;
+    if (bottom && resting) bottom->center = pose_.local(resting->world(bottom->center));
   }
   return bottom;
+}
+void Tracker::follow_rim(const Points& upper, double stamp, const Eigen::Vector2d& sensor_xy,
+                         Result& result) {
+  if (!rim_filter_.ready() || !learned_bottom_) return;
+  for (auto it = rim_recent_.begin(); it != rim_recent_.end();)
+    it = stamp - it->second > rim_repeat_s || stamp < it->second ? rim_recent_.erase(it) : std::next(it);
+  const Eigen::Vector2d axis = learned_bottom_->center.head<2>();
+  const double reach = cfg_.nominal_radius + rim_axis_margin_m;
+  std::vector<double> heights;
+  for (const auto& p : upper) {
+    if ((p.head<2>() - axis).norm() > reach) continue;
+    const auto cell = key(pose_.world(p), rim_repeat_voxel_m);
+    const auto seen = rim_recent_.find(cell);
+    if (seen == rim_recent_.end()) heights.push_back(p.z());
+    if (seen == rim_recent_.end() || stamp >= seen->second) rim_recent_[cell] = stamp;
+  }
+  const Eigen::Vector2d axis_world = pose_.world({axis.x(), axis.y(), 0}).head<2>();
+  const double range = (axis_world - sensor_xy).norm();
+  std::optional<double> ceiling;
+  if (sensor_view_) ceiling = sensor_view_->ceiling_z(axis_world).value_or(cfg_.min_opening_z);
+  rim_filter_.update(stamp, std::move(heights),
+                     std::max(rim_height_noise_min_m, rim_height_noise_per_m * range), ceiling);
+  learned_bottom_->center.z() = rim_filter_.rim() - cfg_.bottom.bucket_height;
+  result.bottom_height_tracked = true;
+  result.rim_height = rim_filter_.rim();
+  result.rim_speed = rim_filter_.speed();
 }
 Points Tracker::accumulate_scans(const Points& current, double stamp) {
   while (!scans_.empty() && stamp - scans_.front().stamp > cfg_.scan_window_s) scans_.pop_front();
@@ -1475,6 +1496,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     learned_bottom_stamp_ = recovered.bottom ? recovered.bottom_stamp : 0;
     mount_anchor_ = recovered.anchor;
     mount_anchor_hits_ = recovered.anchor_hits;
+    if (recovered.bottom)
+      rim_filter_.reset(recovered.bottom->center.z() + cfg_.bottom.bucket_height, stamp);
     pose_ = updated = reidentified->pose;
     have_body_ = identified_ = true;
     acquired_stamp_ = stamp;
@@ -1852,6 +1875,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     frames_.pop_front();
   }
   rebuild(stamp);
+  follow_rim(upper, stamp, sensor_xy, result);
   remember_top_scan(upper, stamp);
   // The full height range is searched rarely: it is the most expensive step and
   // the mount height rarely changes. A contradiction is followed at the fast rate.
@@ -1897,7 +1921,9 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
                                    stamp - mount_conflict_stamp_ > mount_conflict_window_s))
     mount_conflict_hits_ = 0;
   if (bottom && learned_bottom_) {
+    // A followed height moves with a lift, which is then no contradiction.
     const bool height_differs =
+        !rim_filter_.ready() &&
         std::abs(bottom->center.z() - learned_bottom_->center.z()) > cfg_.height_change_m;
     const bool contradicts =
         (bottom->center.head<2>() - learned_bottom_->center.head<2>()).norm() > .12 || height_differs;
@@ -1926,7 +1952,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     }
   }
   if (bottom && !cfg_.inside_field(pose_.world(bottom->center))) bottom.reset();
-  if (bottom && last_bottom_ &&
+  if (bottom && last_bottom_ && !rim_filter_.ready() &&
       std::abs(bottom->center.z() - last_bottom_->center.z()) > cfg_.height_change_m) {
     // The bucket may lift relative to the chassis. Do not blend its old and new
     // heights or keep an old opening observation alive through the lift.
@@ -1936,7 +1962,6 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     top_scans_.clear();
     top_ceilings_.clear();
     top_poses_.clear();
-    top_floor_.reset();
     remember_top_scan(upper, stamp);
     std::tie(bottom, bottom_fit) = detect_bottom();
     if (bottom && !cfg_.inside_field(pose_.world(bottom->center))) bottom.reset();
@@ -1951,7 +1976,8 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     const bool consistent =
         last_bottom_ && stamp - bottom_stamp_ <= cfg_.prediction_s &&
         (bottom->center.head<2>() - last_bottom_->center.head<2>()).norm() < .08 &&
-        std::abs(bottom->center.z() - last_bottom_->center.z()) <= cfg_.height_change_m;
+        (rim_filter_.ready() ||
+         std::abs(bottom->center.z() - last_bottom_->center.z()) <= cfg_.height_change_m);
     bottom_hits_ = consistent ? std::min(cfg_.confirm_hits, bottom_hits_ + 1) : 1;
     last_bottom_ = bottom;
     bottom_stamp_ = stamp;
@@ -1976,6 +2002,11 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
         learned_bottom_ = bottom;
       }
       learned_bottom_stamp_ = stamp;
+      const double fitted_rim = bottom->center.z() + cfg_.bottom.bucket_height;
+      if (!rim_filter_.ready())
+        rim_filter_.reset(fitted_rim, stamp);
+      else if (bottom_fit == Fit::Direct)
+        rim_filter_.measure(fitted_rim);
       result.bottom_tracking_mode = bottom_fit == Fit::Top     ? BottomMode::TopFitted
                                     : bottom_fit == Fit::Shape ? BottomMode::ShapeFitted
                                                                : BottomMode::Direct;
@@ -1996,13 +2027,6 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     if (!bottom_pending_shape_ || stamp - bottom_stamp_ > cfg_.prediction_s) bottom_hits_ = 0;
   }
   result.bottom_observation_stamp = bottom_stamp_;
-  // The rim gives the height even when its returns do not locate the axis.
-  if (result.top_fit.seen_floor_z && top_floor_ && learned_bottom_ &&
-      learned_bottom_->plane_points < cfg_.bottom.min_plane_points &&
-      std::abs(*top_floor_ - learned_bottom_->center.z()) <= top_floor_follow_m) {
-    learned_bottom_->center.z() = *top_floor_;
-    result.bottom_height_observed = true;
-  }
   if (!result.bottom_valid && learned_bottom_) {
     const double age = stamp - learned_bottom_stamp_;
     // Never revive an expired semantic anchor from an arbitrary nearby plane.
@@ -2012,6 +2036,7 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
     } else if (auto plane = track_bucket_bottom(*learned_bottom_, upper, cfg_)) {
       learned_bottom_ = plane;
       learned_bottom_stamp_ = stamp;
+      rim_filter_.measure(plane->center.z() + cfg_.bottom.bucket_height);
       result.bottom_tracking_mode = BottomMode::PlaneTracked;
     } else if (auto shape = track_bucket_shape(*learned_bottom_, upper, cfg_)) {
       learned_bottom_ = shape;

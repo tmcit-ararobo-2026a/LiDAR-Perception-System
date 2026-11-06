@@ -3,6 +3,7 @@
 // Tracking behaviour on a synthetic box robot seen by a sparse scanner.
 #include <Eigen/Geometry>
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <random>
@@ -229,12 +230,42 @@ void test_far_bucket_is_recognized() {
   }
 }
 
+void test_bucket_lift_is_followed() {
+  op::Config c = config();
+  op::Tracker tracker(c);
+  double stamp = 1;
+  int scan = 0;
+  RobotPose robot{0, 0, 0};
+  acquire(tracker, stamp, robot, scan, 1.);
+  std::mt19937 rng(6);
+  const Eigen::Vector2d mount(.1, .05);
+  const double start = stamp;
+  double floor = 1.25, largest_error = 0;
+  bool learned = false;
+  for (; stamp - start < 16; stamp += scan_dt, ++scan) {
+    const double t = stamp - start;
+    // Up by 25 cm after the mount is known, and back down again.
+    floor = 1.25 + std::clamp((t - 7) * .2, 0., .25) - std::clamp((t - 11) * .2, 0., .25);
+    auto points = scan_robot(robot, scan);
+    const auto bucket = scan_bucket(robot, mount, floor, rng);
+    points.insert(points.end(), bucket.begin(), bucket.end());
+    const auto result = tracker.process(points, stamp, sensor);
+    learned = learned || result.tracked_bottom.has_value();
+    if (t > 7 && result.tracked_bottom)
+      largest_error = std::max(largest_error, std::abs(result.tracked_bottom->center.z() - floor));
+  }
+  check(learned, "the mount is learned before the lift");
+  check(largest_error < .2, "the bucket height follows a lift");
+  check(largest_error > 0, "the height was checked during the lift");
+}
+
 int main() {
   test_tracks_continuously();
   test_recovers_after_short_occlusion_with_turn();
   test_reidentifies_after_track_timeout();
   test_static_fixture_does_not_take_the_track();
   test_far_bucket_is_recognized();
+  test_bucket_lift_is_followed();
   if (failures) return 1;
   std::cout << "opening_tracker_test passed\n";
   return 0;

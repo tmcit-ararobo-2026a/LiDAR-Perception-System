@@ -133,16 +133,14 @@ void test_top_cut_off_by_the_view() {
   }
 }
 
-void test_known_floor_is_kept_unless_the_rim_moved() {
+void test_known_floor_is_used() {
   const auto scans = collect(Bucket{}, 3.);
   const op::Config cfg;
   auto context = context_for(scans);
   context.expected_floor_z = floor_z + .02;
-  auto bottom = op::fit_bucket_top(scans, context, cfg);
-  check(bottom && bottom->center.z() == floor_z + .02, "a rim near the known floor changes nothing");
-  context.expected_floor_z = floor_z + .25;
-  bottom = op::fit_bucket_top(scans, context, cfg);
-  check(bottom && std::abs(bottom->center.z() - floor_z) < .03, "a far rim reports the lifted bucket");
+  const auto bottom = op::fit_bucket_top(scans, context, cfg);
+  check(bottom && bottom->center.z() == floor_z + .02, "a known floor is reported as it is");
+  if (bottom) check(xy_error(*bottom) < .03, "a known floor still measures the position");
 }
 
 void test_things_that_are_not_a_bucket() {
@@ -211,7 +209,7 @@ int main() {
   test_only_near_side_is_seen();
   test_too_little_data_waits();
   test_top_cut_off_by_the_view();
-  test_known_floor_is_kept_unless_the_rim_moved();
+  test_known_floor_is_used();
   test_things_that_are_not_a_bucket();
   test_passing_returns_do_not_lift_the_rim();
   test_sensor_view_ceiling();

@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "lidar_perception_system/rim_height_filter.hpp"
 #include "lidar_perception_system/support_candidates.hpp"
 
 namespace lidar_perception_system::opening {
@@ -130,7 +131,7 @@ struct TimedPoints {
 struct TopFitContext {
   double stamp{0};  // Newest measurement time.
   double sigma{0.01};  // Expected radial scatter at the current range (metres).
-  // A known floor height. A fit close to it reports this height and measures only XY.
+  // The floor height when it is already known. The fit then measures only XY.
   std::optional<double> expected_floor_z;
   // Highest height the sensor could see during the window. A top at this limit may be cut off.
   std::optional<double> view_ceiling_z;
@@ -138,7 +139,7 @@ struct TopFitContext {
 struct TopFitStats {
   int band_points{0}, inliers{0}, outside{0}, fresh{0};
   double top_z{0}, arc{0}, uncertainty{0}, width{0};
-  // Floor height implied by a rim that was fully in view.
+  // Floor height the fit used, when it was known or the rim was fully in view.
   std::optional<double> seen_floor_z;
   const char* reason{"not run"};
 };
@@ -186,8 +187,9 @@ struct Result {
   bool bottom_valid{false};
   bool bottom_shape_fitted{false};
   bool bottom_top_fitted{false};
-  // This scan measured the bucket height, whichever way its position was obtained.
-  bool bottom_height_observed{false};
+  // The bucket height comes from the rim followed on every scan.
+  bool bottom_height_tracked{false};
+  double rim_height{0}, rim_speed{0};
   TopFitStats top_fit;
   double bottom_observation_stamp{0};
   std::optional<Bottom> bottom;
@@ -252,6 +254,8 @@ class Tracker {
   struct TopPose {
     double stamp;
     Pose pose;
+    // Followed rim height when the scan was taken, or nothing before it was known.
+    std::optional<double> rim;
   };
   struct PoseSample {
     double stamp;
@@ -285,6 +289,7 @@ class Tracker {
   void rebuild(double stamp);
   Points accumulate_scans(const Points& current, double stamp);
   void remember_top_scan(const Points& upper, double stamp);
+  void follow_rim(const Points& upper, double stamp, const Eigen::Vector2d& sensor_xy, Result& result);
   std::optional<Bottom> fit_top(double stamp, const Eigen::Vector2d& sensor_xy, TopFitStats* stats);
   std::optional<Pose> resting_pose() const;
   void update_motion(double stamp);
@@ -298,9 +303,8 @@ class Tracker {
   std::deque<TimedPoints> top_scans_;
   std::deque<TopCeiling> top_ceilings_;
   std::deque<TopPose> top_poses_;
-  std::optional<double> top_floor_;
-  double top_floor_stamp_{0};
-  int top_floor_trend_{0}, top_floor_side_{0};
+  RimHeightFilter rim_filter_;
+  std::unordered_map<VoxelKey, double, VoxelKeyHash> rim_recent_;
   std::optional<SensorView> sensor_view_;
   std::deque<PoseSample> pose_history_;
   struct ClutterCell {

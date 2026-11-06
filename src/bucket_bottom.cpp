@@ -725,8 +725,6 @@ std::optional<Bottom> track_bucket_shape(const Bottom &learned,
 }
 
 namespace {
-// A rim this close to a known floor is the same bucket, not a lift (metres).
-constexpr double top_height_snap_m = .06;
 // Largest standard deviation of the estimated center (metres).
 constexpr double top_max_uncertainty_m = .04;
 // Share of the band allowed outside the wall, and share of its height the returns must cover.
@@ -741,8 +739,6 @@ constexpr int top_rim_min_points = 15;
 // This many returns further than this above the estimated rim mean it is not the rim.
 constexpr double top_rim_margin_m = .06, top_rim_reach_m = .3;
 constexpr int top_rim_max_above = 3;
-// A lowered bucket leaves at most this many returns where its rim was, with this many below.
-constexpr int top_lowered_max_old = 2, top_lowered_min_new = 60;
 struct TopSample {
   Point p;
   double last;
@@ -800,79 +796,62 @@ std::optional<Bottom> fit_bucket_top(const std::deque<TimedPoints>& scans,
   if (static_cast<int>(samples.size()) < c.top_min_points) return reject("too few lasting returns");
   std::sort(samples.begin(), samples.end(),
             [](const TopSample& a, const TopSample& b) { return a.p.z() > b.p.z(); });
-  // Cloths hanging over the rim and stray returns must not define the height. Wall returns are
-  // spread evenly over the band, so the height below which most of them lie locates the rim.
-  // A bucket may be lifting, so the newest returns decide when there are enough of them.
-  constexpr double rim_share = .1;
-  const auto rim_height = [&](double since) -> std::optional<double> {
-    std::vector<double> heights;
-    for (const auto& s : samples)
-      if (s.last >= since) heights.push_back(s.p.z());
-    if (heights.size() < 3) return std::nullopt;
-    const double highest = heights[2];
-    const size_t in_band = std::count_if(heights.begin(), heights.end(), [&](double z) {
-      return z >= highest - c.top_band_m;
-    });
-    if (static_cast<int>(in_band) < top_rim_min_points) return std::nullopt;
-    return heights[std::min(heights.size() - 1, static_cast<size_t>(rim_share * in_band))] +
-           rim_share * c.top_band_m;
-  };
-  auto recent_top = rim_height(context.stamp - top_rim_window_s);
-  if (!recent_top) recent_top = rim_height(-std::numeric_limits<double>::infinity());
-  if (!recent_top) return reject("too few returns at the top");
-  const double seen_top = *recent_top;
-  info.top_z = seen_top;
-  // A sparse rim does not last long enough to be kept, and the top of the robot below it then
-  // looks like the rim. Returns above the estimate, kept or not, show that it is too low.
-  std::vector<double> band_x, band_y;
-  for (const auto& s : samples)
-    if (s.p.z() >= seen_top - c.top_band_m && s.p.z() <= seen_top) {
-      band_x.push_back(s.p.x());
-      band_y.push_back(s.p.y());
-    }
-  int above = 0;
-  if (!band_x.empty()) {
-    std::nth_element(band_x.begin(), band_x.begin() + band_x.size() / 2, band_x.end());
-    std::nth_element(band_y.begin(), band_y.begin() + band_y.size() / 2, band_y.end());
-    const XY middle(band_x[band_x.size() / 2], band_y[band_y.size() / 2]);
-    for (const auto& scan : scans) {
-      if (scan.stamp < context.stamp - top_rim_window_s) continue;
-      for (const auto& p : scan.points)
-        above += p.allFinite() && p.z() > seen_top + top_rim_margin_m &&
-                 (p.head<2>() - middle).norm() < top_rim_reach_m;
-    }
-  }
-  bool rim_seen = above < top_rim_max_above;
-  // Far away the bucket can return nothing for seconds while the chassis below it still does, so
-  // a lower top alone does not mean it came down. The chassis must be dense and the height where
-  // the rim was must be empty, in view.
-  if (rim_seen && context.expected_floor_z &&
-      seen_top - c.bucket_height < *context.expected_floor_z - top_height_snap_m) {
-    const double old_top = *context.expected_floor_z + c.bucket_height;
-    const bool old_top_in_view = !context.view_ceiling_z || old_top + .03 < *context.view_ceiling_z;
-    int at_old_top = 0;
-    for (const auto& scan : scans)
-      for (const auto& p : scan.points)
-        at_old_top += p.allFinite() && p.z() > old_top - c.top_band_m && p.z() < old_top + .05;
-    const size_t below = std::count_if(samples.begin(), samples.end(), [&](const TopSample& s) {
-      return s.p.z() >= seen_top - c.top_band_m && s.p.z() <= seen_top;
-    });
-    rim_seen = old_top_in_view && at_old_top <= top_lowered_max_old &&
-               static_cast<int>(below) >= top_lowered_min_new;
-  }
-  const bool top_in_view =
-      rim_seen && (!context.view_ceiling_z || seen_top + .03 < *context.view_ceiling_z);
-  // A short view cuts off the rim, so the highest return says nothing about the bucket height.
-  // The floor is then taken from what was learned earlier, or the fit waits for a better view.
-  double floor_z = seen_top - c.bucket_height;
-  if (top_in_view) info.seen_floor_z = floor_z;
+  double floor_z = 0;
   bool floor_known = false;
-  if (context.expected_floor_z &&
-      (!top_in_view || std::abs(floor_z - *context.expected_floor_z) <= top_height_snap_m)) {
+  if (context.expected_floor_z) {
     floor_z = *context.expected_floor_z;
     floor_known = true;
-  } else if (!top_in_view) {
-    return reject("top is at the edge of the view");
+    info.top_z = floor_z + c.bucket_height;
+    info.seen_floor_z = floor_z;
+  } else {
+    // Cloths hanging over the rim and stray returns must not define the height. Wall returns are
+    // spread evenly over the band, so the height below which most of them lie locates the rim.
+    // A bucket may be lifting, so the newest returns decide when there are enough of them.
+    constexpr double rim_share = .1;
+    const auto rim_height = [&](double since) -> std::optional<double> {
+      std::vector<double> heights;
+      for (const auto& s : samples)
+        if (s.last >= since) heights.push_back(s.p.z());
+      if (heights.size() < 3) return std::nullopt;
+      const double highest = heights[2];
+      const size_t in_band = std::count_if(heights.begin(), heights.end(), [&](double z) {
+        return z >= highest - c.top_band_m;
+      });
+      if (static_cast<int>(in_band) < top_rim_min_points) return std::nullopt;
+      return heights[std::min(heights.size() - 1, static_cast<size_t>(rim_share * in_band))] +
+             rim_share * c.top_band_m;
+    };
+    auto recent_top = rim_height(context.stamp - top_rim_window_s);
+    if (!recent_top) recent_top = rim_height(-std::numeric_limits<double>::infinity());
+    if (!recent_top) return reject("too few returns at the top");
+    const double seen_top = *recent_top;
+    info.top_z = seen_top;
+    // A sparse rim does not last long enough to be kept, and the top of the robot below it then
+    // looks like the rim. Returns above the estimate, kept or not, show that it is too low.
+    std::vector<double> band_x, band_y;
+    for (const auto& s : samples)
+      if (s.p.z() >= seen_top - c.top_band_m && s.p.z() <= seen_top) {
+        band_x.push_back(s.p.x());
+        band_y.push_back(s.p.y());
+      }
+    int above = 0;
+    if (!band_x.empty()) {
+      std::nth_element(band_x.begin(), band_x.begin() + band_x.size() / 2, band_x.end());
+      std::nth_element(band_y.begin(), band_y.begin() + band_y.size() / 2, band_y.end());
+      const XY middle(band_x[band_x.size() / 2], band_y[band_y.size() / 2]);
+      for (const auto& scan : scans) {
+        if (scan.stamp < context.stamp - top_rim_window_s) continue;
+        for (const auto& p : scan.points)
+          above += p.allFinite() && p.z() > seen_top + top_rim_margin_m &&
+                   (p.head<2>() - middle).norm() < top_rim_reach_m;
+      }
+    }
+    // A short view cuts off the rim, so the highest return says nothing about the bucket height.
+    if (above >= top_rim_max_above ||
+        (context.view_ceiling_z && seen_top + .03 >= *context.view_ceiling_z))
+      return reject("top is at the edge of the view");
+    floor_z = seen_top - c.bucket_height;
+    info.seen_floor_z = floor_z;
   }
   const double top_z = floor_z + c.bucket_height;
   if (top_z < cfg.min_opening_z - c.height_tolerance ||

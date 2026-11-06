@@ -619,11 +619,12 @@ class BucketTracker : public rclcpp::Node {
       op::Point normal(t.normal.x, t.normal.y, t.normal.z);
       bottom_pose_filter_.update(center, normal, rclcpp::Time(header.stamp).seconds(),
                                  r.track_id, cfg_.reset_s, r.bottom_valid,
-                                 r.bottom_valid || r.bottom_height_observed ||
+                                 r.bottom_valid ||
                                      r.bottom_tracking_mode == op::BottomMode::PlaneTracked,
                                  r.bottom_valid ||
                                      r.bottom_tracking_mode == op::BottomMode::ShapeFitted ||
-                                     r.bottom_tracking_mode == op::BottomMode::TopFitted);
+                                     r.bottom_tracking_mode == op::BottomMode::TopFitted,
+                                 r.bottom_height_tracked);
       t.center = point(center);
       t.normal.x = normal.x();
       t.normal.y = normal.y();
@@ -873,6 +874,8 @@ class BucketTracker : public rclcpp::Node {
     add("bottom_top_wall_points", last_result_.top_fit.inliers);
     add("bottom_top_arc", last_result_.top_fit.arc);
     add("bottom_top_height", last_result_.top_fit.top_z);
+    add("bottom_rim_height", last_result_.rim_height);
+    add("bottom_rim_speed", last_result_.rim_speed);
     add("bottom_tracking_valid", bottom_output_.valid);
     add("bottom_tracking_mode", bottom_output_.observation_mode);
     add("bottom_tracked_frames", bottom_tracked_);

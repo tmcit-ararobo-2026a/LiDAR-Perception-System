@@ -28,7 +28,8 @@ class BottomPoseFilter {
   void reset() { ready_ = false; }
   void update(Eigen::Vector3d& center, Eigen::Vector3d& normal, double stamp,
               uint32_t id, double max_gap, bool confirmed_geometry = false,
-              bool height_observed = true, bool xy_observed = true) {
+              bool height_observed = true, bool xy_observed = true,
+              bool height_tracked = false) {
     const double dt = stamp - stamp_;
     const double previous_height = center_.z();
     const Eigen::Vector2d previous_xy = center_.head<2>();
@@ -136,7 +137,7 @@ class BottomPoseFilter {
                                                 : Eigen::Vector2d(Eigen::Vector2d::Zero());
         output_velocity_ = velocity_.head<2>();
         stationary_ = false;
-        center_.z() = height_changed ? center.z() : previous_height;
+        center_.z() = height_changed || height_tracked ? center.z() : previous_height;
         ready_ = true;
         id_ = id;
         stamp_ = stamp;
@@ -164,7 +165,8 @@ class BottomPoseFilter {
         std::sort(heights.begin(), heights.end());
         observed_height = heights[heights.size() / 2];
       }
-      center_.z() = height_changed ? center.z() : height_observed
+      // A tracked height is already filtered, and limiting it here would only delay a lift.
+      center_.z() = height_changed || height_tracked ? center.z() : height_observed
                         ? previous_height + height_alpha *
                               std::clamp(observed_height - previous_height, -.015, .015)
                         : previous_height;
