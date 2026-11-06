@@ -1,5 +1,5 @@
 # Bottom geometry in header.frame_id. This is not an opening/aim point.
-# /bottom is confirmed geometry (DIRECT or SHAPE_FITTED);
+# /bottom is confirmed geometry (DIRECT, SHAPE_FITTED or TOP_FITTED);
 # /bottom_track also includes tracked/inferred poses.
 # Consumers must check valid and the measurement stamp; stale data is invalid.
 std_msgs/Header header
@@ -15,6 +15,9 @@ uint8 BODY_INFERRED=3
 # SHAPE_FITTED uses current frustum side evidence and a supported/learned
 # bottom plane. A side-only update measures XY while retaining plane height.
 uint8 SHAPE_FITTED=4
+# TOP_FITTED fits the rulebook frustum to the topmost returns of the robot, collected over
+# several seconds in the robot frame. The rim gives the height and the wall gives XY.
+uint8 TOP_FITTED=5
 uint8 observation_mode
 geometry_msgs/Point center
 geometry_msgs/Vector3 normal

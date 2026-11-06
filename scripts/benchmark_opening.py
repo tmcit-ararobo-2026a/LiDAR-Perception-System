@@ -227,6 +227,7 @@ def main():
             'track_ids': len({track for track, _ in bottom_observations.values()}),
             'direct': sum(mode == BucketBottom.DIRECT for _, mode in bottom_observations.values()),
             'shape_fitted': sum(mode == BucketBottom.SHAPE_FITTED for _, mode in bottom_observations.values()),
+            'top_fitted': sum(mode == BucketBottom.TOP_FITTED for _, mode in bottom_observations.values()),
                             'accuracy_evaluated': False}
         track_stamps = sorted(bottom_tracks)
         report['bottom_tracking'] = {
@@ -234,6 +235,7 @@ def main():
             'direct': sum(mode == BucketBottom.DIRECT for mode, _ in bottom_tracks.values()),
             'plane_tracked': sum(mode == BucketBottom.PLANE_TRACKED for mode, _ in bottom_tracks.values()),
             'shape_fitted': sum(mode == BucketBottom.SHAPE_FITTED for mode, _ in bottom_tracks.values()),
+            'top_fitted': sum(mode == BucketBottom.TOP_FITTED for mode, _ in bottom_tracks.values()),
             'body_inferred': sum(mode == BucketBottom.BODY_INFERRED for mode, _ in bottom_tracks.values()),
             'track_ids': len({track for _, track in bottom_tracks.values()}),
             'max_gap_between_valid_outputs_s': max(

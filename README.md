@@ -116,6 +116,26 @@ ros2 launch lidar_perception_system bucket_tracker.launch.py start_zone:=red
 
 処理負荷を抑えるため底面の全探索は間引いているので、`/bucket_opening_tracker/bottom` の更新頻度は `search_interval_s` で頭打ちになります。毎スキャンの位置が必要な場合は `/bucket_opening_tracker/bottom_track` を使ってください。
 
+### 遠距離の底面認識
+
+透明なバケツが遠くにあると、1スキャンの点が少なく、壁の点も距離とともにばらつくので、底面の平面や壁をそのままでは捉えられません。そこで、ルールブックの「ロボットとマスコットは移動バケツの2L目盛りより上に出られない」を使い、相手ロボットの最上部を数秒分集めて規定寸法のバケツを当てはめます（`observation_mode` は `TOP_FITTED`）。上端の高さから底面の高さを、最上部の点の広がりから中心を求めます。
+
+| 項目 | 既定値 | 内容 |
+|---|---|---|
+| `bottom.top_fit_enabled` | true | この方式を使う |
+| `bottom.top_window_s` | 3.0 | 点を集める時間（秒）。長いほど遠くまで安定するが、初回の認識が遅れる |
+| `bottom.top_band_m` | 0.17 | 上端から下へ、バケツだけが占めるとみなす高さ（m） |
+| `bottom.floor_radius` | 0.1076 | バケツ底面の半径（m）。開口の半径は `opening.nominal_radius` |
+| `bottom.top_noise_per_m` | 0.0045 | 点のばらつきの距離比例分（m/m）。実測は5.6〜5.8m先でσ2.3〜2.8cm |
+| `bottom.top_noise_min_m` | 0.006 | 点のばらつきの下限（m） |
+| `bottom.top_min_points` | 25 | 当てはめに必要な上端付近の点数 |
+| `bottom.top_min_inliers` | 15 | 壁上にあるべき点数 |
+| `bottom.top_min_arc` | 1.75 | 点が中心の周りを覆うべき角度（rad） |
+| `sensor.frame` | `livox_frame` | LiDARのフレーム。視野の計算に使う。空またはTFがなければ視野は判定しない |
+| `sensor.min_elevation_deg` / `max_elevation_deg` | -7 / 52 | LiDAR座標系での視野の上下限（度） |
+
+上端がLiDARの視野の外にあると高さを判定できません。この場合は、すでに学習した高さがあれば位置だけを更新し、なければ見えるまで待ちます。相手が静止している間は地図座標のまま点を集めるので、相手姿勢のふらつきの影響を受けません。
+
 ## 出力
 
 ノード・launch名は整理しましたが、既存のトピック名・メッセージ型・TF名は維持しています。
@@ -124,7 +144,7 @@ ros2 launch lidar_perception_system bucket_tracker.launch.py start_zone:=red
 |---|---|
 | `/bucket_opening_tracker/target` | 鮮度監視後の開口中心（`MovingBucketTrack`） |
 | `/bucket_opening_tracker/target_raw` | 鮮度監視前の開口推定 |
-| `/bucket_opening_tracker/bottom` | 確定した底面形状（`BucketBottom`） |
+| `/bucket_opening_tracker/bottom` | 確定した底面位置（`BucketBottom`。`DIRECT`、`SHAPE_FITTED`、`TOP_FITTED`） |
 | `/bucket_opening_tracker/bottom_track` | 平滑化した追跡・推定を含む底面位置（`BucketBottom`） |
 | `/bucket_opening_tracker/bottom_track_raw` | 平滑化前の底面追跡位置（揺れの解析用） |
 | `/bucket_opening_tracker/diagnostics` | 処理状態・TF待ち・処理時間など |

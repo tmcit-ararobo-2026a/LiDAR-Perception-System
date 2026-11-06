@@ -56,7 +56,16 @@
     "max_body_inference_s": 0.0,
     "min_plane_points": 20,
     "min_current_points": 4,
-    "min_side_points": 6
+    "min_side_points": 6,
+    "top_fit_enabled": true,
+    "top_window_s": 3.0,
+    "top_band_m": 0.17,
+    "floor_radius": 0.1076,
+    "top_noise_per_m": 0.0045,
+    "top_noise_min_m": 0.006,
+    "top_min_points": 25,
+    "top_min_inliers": 15,
+    "top_min_arc": 1.75
   },
   "tracking": {
     "confirm_hits": 3, "max_prediction_s": 0.3,
@@ -67,6 +76,7 @@
     "clutter_learn_s": 3.0, "clutter_forget_s": 20.0,
     "clutter_min_rate_hz": 2.0, "clutter_max_extent_m": 0.6
   },
+  "sensor": {"frame": "livox_frame", "min_elevation_deg": -7.0, "max_elevation_deg": 52.0},
   "tf_wait_s": 0.9,
   "queue_size": 12,
   "max_input_bytes": 8388608,

@@ -143,6 +143,15 @@ op::Config read_config(const nlohmann::json& j, const std::string& start_zone) {
   READ_BOTTOM(sparse_shape_enabled);
   READ_BOTTOM(shape_tracking_min_points);
   READ_BOTTOM(search_interval_s);
+  READ_BOTTOM(top_fit_enabled);
+  READ_BOTTOM(top_window_s);
+  READ_BOTTOM(top_band_m);
+  READ_BOTTOM(floor_radius);
+  READ_BOTTOM(top_noise_per_m);
+  READ_BOTTOM(top_noise_min_m);
+  READ_BOTTOM(top_min_points);
+  READ_BOTTOM(top_min_inliers);
+  READ_BOTTOM(top_min_arc);
 #undef READ_BOTTOM
   c.prediction_s = tracking.value("max_prediction_s", c.prediction_s);
   c.validate();
@@ -203,6 +212,14 @@ class BucketTracker : public rclcpp::Node {
     input_topic_ = j.at("input_topic").get<std::string>();
     if (frame_.empty() || input_topic_.empty()) {
       throw std::invalid_argument("Input topic and target frame must be nonempty");
+    }
+    const auto sensor = j.value("sensor", nlohmann::json::object());
+    sensor_frame_ = sensor.value("frame", std::string{});
+    sensor_min_elevation_ = sensor.value("min_elevation_deg", -90.) * M_PI / 180;
+    sensor_max_elevation_ = sensor.value("max_elevation_deg", 90.) * M_PI / 180;
+    if (!std::isfinite(sensor_min_elevation_) || !std::isfinite(sensor_max_elevation_) ||
+        sensor_min_elevation_ >= sensor_max_elevation_) {
+      throw std::invalid_argument("sensor min_elevation_deg must be below max_elevation_deg");
     }
     tf_wait_s_ = j.value("tf_wait_s", 0.2);
     queue_limit_ = j.value("queue_size", 4);
@@ -350,6 +367,25 @@ class BucketTracker : public rclcpp::Node {
     reason_ = why;
     last_result_.valid = false;
   }
+  // Tells the tracker how high the sensor can see. Without the transform nothing is ruled out.
+  std::optional<op::SensorView> sensor_view(const builtin_interfaces::msg::Time& stamp) const {
+    if (sensor_frame_.empty()) return std::nullopt;
+    geometry_msgs::msg::TransformStamped sensor;
+    try {
+      sensor = buffer_->lookupTransform(frame_, sensor_frame_, rclcpp::Time(stamp),
+                                        rclcpp::Duration::from_seconds(0));
+    } catch (const tf2::TransformException&) {
+      return std::nullopt;
+    }
+    const auto& q = sensor.transform.rotation;
+    const auto& t = sensor.transform.translation;
+    op::SensorView view;
+    view.origin = {t.x, t.y, t.z};
+    view.axis = Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized() * op::Point::UnitZ();
+    view.min_elevation = sensor_min_elevation_;
+    view.max_elevation = sensor_max_elevation_;
+    return view;
+  }
   op::Points decode(const Cloud& c, const geometry_msgs::msg::TransformStamped& transform) const {
     // A structured zero-width cloud is a valid observation with no returns.
     // Process it as a miss so the learned opening expires without a decode
@@ -425,6 +461,7 @@ class BucketTracker : public rclcpp::Node {
       const auto points = decode(*item.cloud, transform);
       const auto& t = transform.transform.translation;
       const double stamp = rclcpp::Time(item.cloud->header.stamp).seconds();
+      tracker_->set_sensor_view(sensor_view(item.cloud->header.stamp));
       last_result_ = tracker_->process(points, stamp, {t.x, t.y});
       body_frames_ += last_result_.body_valid;
       reidentified_frames_ += last_result_.body_reidentified;
@@ -541,17 +578,23 @@ class BucketTracker : public rclcpp::Node {
       t.confidence = .5 * std::min(1., b.current_points / 6.) *
                      std::clamp(1. - b.boundary_residual / tolerance, 0., 1.);
     }
+    if (mode == op::BottomMode::TopFitted) {
+      t.confidence = .5 * std::min(1., b.side_points / 60.);
+    }
     return t;
   }
   void publish_bottom(const op::Result& r, std_msgs::msg::Header header) {
     header.frame_id = frame_;
-    const auto measurement_mode = !r.bottom_valid ? op::BottomMode::None
-        : (r.bottom_shape_fitted ? op::BottomMode::ShapeFitted : op::BottomMode::Direct);
+    const auto measurement_mode = !r.bottom_valid   ? op::BottomMode::None
+                                  : r.bottom_top_fitted   ? op::BottomMode::TopFitted
+                                  : r.bottom_shape_fitted ? op::BottomMode::ShapeFitted
+                                                          : op::BottomMode::Direct;
     auto measured = bottom_message(r, header, r.bottom, measurement_mode, bottom_direct_stamp_);
     if (measured.valid) {
       bottom_direct_stamp_ = measured.last_observation_stamp;
       ++bottom_observed_;
       bottom_shape_observed_ += r.bottom_shape_fitted;
+      bottom_top_observed_ += r.bottom_top_fitted;
     }
     bottom_->publish(measured);
     // Retain the exact plane timestamp even when processing latency prevents
@@ -576,10 +619,11 @@ class BucketTracker : public rclcpp::Node {
       op::Point normal(t.normal.x, t.normal.y, t.normal.z);
       bottom_pose_filter_.update(center, normal, rclcpp::Time(header.stamp).seconds(),
                                  r.track_id, cfg_.reset_s, r.bottom_valid,
-                                 r.bottom_valid ||
+                                 r.bottom_valid || r.bottom_height_observed ||
                                      r.bottom_tracking_mode == op::BottomMode::PlaneTracked,
                                  r.bottom_valid ||
-                                     r.bottom_tracking_mode == op::BottomMode::ShapeFitted);
+                                     r.bottom_tracking_mode == op::BottomMode::ShapeFitted ||
+                                     r.bottom_tracking_mode == op::BottomMode::TopFitted);
       t.center = point(center);
       t.normal.x = normal.x();
       t.normal.y = normal.y();
@@ -615,7 +659,8 @@ class BucketTracker : public rclcpp::Node {
       ring.scale.x = .012;
       const bool inferred = t.observation_mode == BottomTrack::BODY_INFERRED;
       const bool shape = t.observation_mode == BottomTrack::SHAPE_FITTED;
-      ring.color.r = inferred ? 0 : 1;
+      const bool top = t.observation_mode == BottomTrack::TOP_FITTED;
+      ring.color.r = inferred || top ? 0 : 1;
       ring.color.g = shape ? .25 : (t.observation_mode == BottomTrack::DIRECT ? .55 : 1);
       ring.color.b = inferred || shape ? 1 : 0;
       center_marker.action = Marker::ADD;
@@ -822,6 +867,12 @@ class BucketTracker : public rclcpp::Node {
     add("bottom_observed_frames", bottom_observed_);
     add("bottom_shape_observed_frames", bottom_shape_observed_);
     add("bottom_shape_fitted", last_result_.bottom_shape_fitted);
+    add("bottom_top_observed_frames", bottom_top_observed_);
+    add("bottom_top_fitted", last_result_.bottom_top_fitted);
+    add("bottom_top_band_points", last_result_.top_fit.band_points);
+    add("bottom_top_wall_points", last_result_.top_fit.inliers);
+    add("bottom_top_arc", last_result_.top_fit.arc);
+    add("bottom_top_height", last_result_.top_fit.top_z);
     add("bottom_tracking_valid", bottom_output_.valid);
     add("bottom_tracking_mode", bottom_output_.observation_mode);
     add("bottom_tracked_frames", bottom_tracked_);
@@ -854,8 +905,8 @@ class BucketTracker : public rclcpp::Node {
   op::Config cfg_;
   std::unique_ptr<op::Tracker> tracker_;
   op::Result last_result_;
-  std::string frame_, input_topic_, reason_{"waiting for input"};
-  double tf_wait_s_{}, radius_{0.1365};
+  std::string frame_, input_topic_, sensor_frame_, reason_{"waiting for input"};
+  double tf_wait_s_{}, radius_{0.1365}, sensor_min_elevation_{-M_PI / 2}, sensor_max_elevation_{M_PI / 2};
   int queue_limit_{}, max_bytes_{};
   int64_t last_input_ns_{0};
   builtin_interfaces::msg::Time last_observation_;
@@ -879,7 +930,7 @@ class BucketTracker : public rclcpp::Node {
   std_msgs::msg::Header body_debug_header_;
   std::chrono::steady_clock::time_point body_debug_received_;
   std::chrono::steady_clock::time_point bottom_received_;
-  uint64_t bottom_observed_{0}, bottom_shape_observed_{0}, bottom_tracked_{0};
+  uint64_t bottom_observed_{0}, bottom_shape_observed_{0}, bottom_top_observed_{0}, bottom_tracked_{0};
   rclcpp::Publisher<Cloud>::SharedPtr selected_, accumulated_, bottom_cloud_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr markers_, robot_markers_,

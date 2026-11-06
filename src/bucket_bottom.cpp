@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <limits>
 #include <map>
 #include <random>
@@ -721,6 +722,277 @@ std::optional<Bottom> track_bucket_shape(const Bottom &learned,
   if (ambiguous)
     return {};
   return best;
+}
+
+namespace {
+// A rim this close to a known floor is the same bucket, not a lift (metres).
+constexpr double top_height_snap_m = .06;
+// Largest standard deviation of the estimated center (metres).
+constexpr double top_max_uncertainty_m = .04;
+// Share of the band allowed outside the wall, and share of its height the returns must cover.
+constexpr double top_max_outside_ratio = .2, top_min_span_ratio = .5;
+// Smallest standard deviation of the returns around the center along their widest direction.
+constexpr double top_min_width_m = .06;
+// Wall returns this recent make the fit a current observation (seconds).
+constexpr double top_fresh_s = .5;
+// The rim height comes from returns this recent (seconds), if there are this many of them.
+constexpr double top_rim_window_s = 1.0;
+constexpr int top_rim_min_points = 15;
+// This many returns further than this above the estimated rim mean it is not the rim.
+constexpr double top_rim_margin_m = .06, top_rim_reach_m = .3;
+constexpr int top_rim_max_above = 3;
+// A lowered bucket leaves at most this many returns where its rim was, with this many below.
+constexpr int top_lowered_max_old = 2, top_lowered_min_new = 60;
+struct TopSample {
+  Point p;
+  double last;
+};
+// Merge repeated returns and drop those not seen again later: passing hands, thrown cloths
+// and people do not stay in place in the robot frame. Republished scan windows would count
+// several times otherwise.
+std::vector<TopSample> lasting_samples(const std::deque<TimedPoints>& scans) {
+  constexpr double fine_m = .01, coarse_m = .06, min_seen_s = .4;
+  struct Cell {
+    Point sum{0, 0, 0};
+    int count{0};
+    double first{std::numeric_limits<double>::infinity()}, last{-first};
+  };
+  const auto key = [](const Point& p, double size) {
+    return std::array<int, 3>{static_cast<int>(std::floor(p.x() / size)),
+                              static_cast<int>(std::floor(p.y() / size)),
+                              static_cast<int>(std::floor(p.z() / size))};
+  };
+  std::map<std::array<int, 3>, Cell> fine, coarse;
+  for (const auto& scan : scans)
+    for (const auto& p : scan.points) {
+      if (!p.allFinite()) continue;
+      for (auto* group : {&fine, &coarse}) {
+        auto& cell = (*group)[key(p, group == &fine ? fine_m : coarse_m)];
+        cell.sum += p;
+        ++cell.count;
+        cell.first = std::min(cell.first, scan.stamp);
+        cell.last = std::max(cell.last, scan.stamp);
+      }
+    }
+  std::vector<TopSample> out;
+  out.reserve(fine.size());
+  for (const auto& item : fine) {
+    const Point p = item.second.sum / item.second.count;
+    const auto& seen = coarse.at(key(p, coarse_m));
+    if (seen.last - seen.first >= min_seen_s) out.push_back({p, item.second.last});
+  }
+  return out;
+}
+}  // namespace
+
+std::optional<Bottom> fit_bucket_top(const std::deque<TimedPoints>& scans,
+                                     const TopFitContext& context, const Config& cfg,
+                                     TopFitStats* stats) {
+  TopFitStats local;
+  TopFitStats& info = stats ? *stats : local;
+  const auto reject = [&](const char* reason) -> std::optional<Bottom> {
+    info.reason = reason;
+    return std::nullopt;
+  };
+  const auto& c = cfg.bottom;
+  const double sigma = std::max(context.sigma, 1e-3);
+  auto samples = lasting_samples(scans);
+  if (static_cast<int>(samples.size()) < c.top_min_points) return reject("too few lasting returns");
+  std::sort(samples.begin(), samples.end(),
+            [](const TopSample& a, const TopSample& b) { return a.p.z() > b.p.z(); });
+  // Cloths hanging over the rim and stray returns must not define the height. Wall returns are
+  // spread evenly over the band, so the height below which most of them lie locates the rim.
+  // A bucket may be lifting, so the newest returns decide when there are enough of them.
+  constexpr double rim_share = .1;
+  const auto rim_height = [&](double since) -> std::optional<double> {
+    std::vector<double> heights;
+    for (const auto& s : samples)
+      if (s.last >= since) heights.push_back(s.p.z());
+    if (heights.size() < 3) return std::nullopt;
+    const double highest = heights[2];
+    const size_t in_band = std::count_if(heights.begin(), heights.end(), [&](double z) {
+      return z >= highest - c.top_band_m;
+    });
+    if (static_cast<int>(in_band) < top_rim_min_points) return std::nullopt;
+    return heights[std::min(heights.size() - 1, static_cast<size_t>(rim_share * in_band))] +
+           rim_share * c.top_band_m;
+  };
+  auto recent_top = rim_height(context.stamp - top_rim_window_s);
+  if (!recent_top) recent_top = rim_height(-std::numeric_limits<double>::infinity());
+  if (!recent_top) return reject("too few returns at the top");
+  const double seen_top = *recent_top;
+  info.top_z = seen_top;
+  // A sparse rim does not last long enough to be kept, and the top of the robot below it then
+  // looks like the rim. Returns above the estimate, kept or not, show that it is too low.
+  std::vector<double> band_x, band_y;
+  for (const auto& s : samples)
+    if (s.p.z() >= seen_top - c.top_band_m && s.p.z() <= seen_top) {
+      band_x.push_back(s.p.x());
+      band_y.push_back(s.p.y());
+    }
+  int above = 0;
+  if (!band_x.empty()) {
+    std::nth_element(band_x.begin(), band_x.begin() + band_x.size() / 2, band_x.end());
+    std::nth_element(band_y.begin(), band_y.begin() + band_y.size() / 2, band_y.end());
+    const XY middle(band_x[band_x.size() / 2], band_y[band_y.size() / 2]);
+    for (const auto& scan : scans) {
+      if (scan.stamp < context.stamp - top_rim_window_s) continue;
+      for (const auto& p : scan.points)
+        above += p.allFinite() && p.z() > seen_top + top_rim_margin_m &&
+                 (p.head<2>() - middle).norm() < top_rim_reach_m;
+    }
+  }
+  bool rim_seen = above < top_rim_max_above;
+  // Far away the bucket can return nothing for seconds while the chassis below it still does, so
+  // a lower top alone does not mean it came down. The chassis must be dense and the height where
+  // the rim was must be empty, in view.
+  if (rim_seen && context.expected_floor_z &&
+      seen_top - c.bucket_height < *context.expected_floor_z - top_height_snap_m) {
+    const double old_top = *context.expected_floor_z + c.bucket_height;
+    const bool old_top_in_view = !context.view_ceiling_z || old_top + .03 < *context.view_ceiling_z;
+    int at_old_top = 0;
+    for (const auto& scan : scans)
+      for (const auto& p : scan.points)
+        at_old_top += p.allFinite() && p.z() > old_top - c.top_band_m && p.z() < old_top + .05;
+    const size_t below = std::count_if(samples.begin(), samples.end(), [&](const TopSample& s) {
+      return s.p.z() >= seen_top - c.top_band_m && s.p.z() <= seen_top;
+    });
+    rim_seen = old_top_in_view && at_old_top <= top_lowered_max_old &&
+               static_cast<int>(below) >= top_lowered_min_new;
+  }
+  const bool top_in_view =
+      rim_seen && (!context.view_ceiling_z || seen_top + .03 < *context.view_ceiling_z);
+  // A short view cuts off the rim, so the highest return says nothing about the bucket height.
+  // The floor is then taken from what was learned earlier, or the fit waits for a better view.
+  double floor_z = seen_top - c.bucket_height;
+  if (top_in_view) info.seen_floor_z = floor_z;
+  bool floor_known = false;
+  if (context.expected_floor_z &&
+      (!top_in_view || std::abs(floor_z - *context.expected_floor_z) <= top_height_snap_m)) {
+    floor_z = *context.expected_floor_z;
+    floor_known = true;
+  } else if (!top_in_view) {
+    return reject("top is at the edge of the view");
+  }
+  const double top_z = floor_z + c.bucket_height;
+  if (top_z < cfg.min_opening_z - c.height_tolerance ||
+      top_z > cfg.max_opening_z + c.height_tolerance)
+    return reject("top outside the rulebook height");
+  std::vector<TopSample> band;
+  for (const auto& s : samples)
+    if (s.p.z() >= top_z - c.top_band_m && s.p.z() <= top_z + .05) band.push_back(s);
+  info.band_points = static_cast<int>(band.size());
+  if (static_cast<int>(band.size()) < c.top_min_points) return reject("too few returns in the band");
+  // Bounded work: a near robot returns far more than this estimate can use.
+  constexpr size_t max_band_points = 150;
+  std::vector<TopSample> used;
+  const size_t stride = std::max<size_t>(1, (band.size() + max_band_points - 1) / max_band_points);
+  for (size_t i = 0; i < band.size(); i += stride) used.push_back(band[i]);
+  XY seed = XY::Zero();
+  for (const auto& s : used) seed += s.p.head<2>();
+  seed /= used.size();
+  const auto radius_at = [&](const TopSample& s) {
+    return shape_radius(c.floor_radius, s.p.z() - floor_z, cfg);
+  };
+  // A transparent wall returns weakly, and the near and far walls are too close for the sensor
+  // to separate, so returns appear on the wall and anywhere between the walls. Outside the wall
+  // they are unexplained: only the bucket may occupy this band.
+  const double wall_sigma = std::max(sigma, .012);
+  const double wall_norm = 1. / (std::sqrt(2 * pi) * wall_sigma);
+  constexpr double wall_share = .45, inner_share = .45, stray_density = .1 / (.6 * .6);
+  const auto log_likelihood = [&](const XY& center) {
+    double sum = 0;
+    for (const auto& s : used) {
+      const double r = radius_at(s);
+      const double e = (s.p.head<2>() - center).norm() - r;
+      const double ring = wall_norm * std::exp(-.5 * e * e / (wall_sigma * wall_sigma)) / (2 * pi * r);
+      const double inner = 1. / (1. + std::exp(1.7 * e / wall_sigma)) / (pi * r * r);
+      sum += std::log(wall_share * ring + inner_share * inner + stray_density);
+    }
+    return sum;
+  };
+  // The likelihood is broad and uneven when returns are few, so its peak jumps between scans.
+  // Its mean does not, and its spread tells whether the returns locate the bucket at all.
+  constexpr double step = .015, temper = .5;
+  const int cells = static_cast<int>(std::ceil((cfg.nominal_radius + .03) / step));
+  std::vector<std::pair<double, XY>> grid;
+  grid.reserve((2 * cells + 1) * (2 * cells + 1));
+  double peak = -std::numeric_limits<double>::infinity();
+  for (int ix = -cells; ix <= cells; ++ix)
+    for (int iy = -cells; iy <= cells; ++iy) {
+      const XY candidate = seed + XY(ix * step, iy * step);
+      const double value = log_likelihood(candidate);
+      grid.emplace_back(value, candidate);
+      peak = std::max(peak, value);
+    }
+  double total = 0;
+  XY center = XY::Zero();
+  for (const auto& cell : grid) {
+    const double weight = std::exp(temper * (cell.first - peak));
+    total += weight;
+    center += weight * cell.second;
+  }
+  center /= total;
+  Eigen::Matrix2d spread = Eigen::Matrix2d::Zero();
+  for (const auto& cell : grid) {
+    const XY delta = cell.second - center;
+    spread += std::exp(temper * (cell.first - peak)) * delta * delta.transpose();
+  }
+  spread /= total;
+  const double uncertainty =
+      std::sqrt(Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(spread).eigenvalues()[1]);
+  info.uncertainty = uncertainty;
+  if (uncertainty > top_max_uncertainty_m) return reject("returns do not locate a center");
+  int inliers = 0, outside = 0, fresh = 0;
+  double squared = 0, low = std::numeric_limits<double>::infinity(), high = -low;
+  std::array<bool, 24> sectors{};
+  Eigen::Matrix2d scatter = Eigen::Matrix2d::Zero();
+  for (const auto& s : band) {
+    const XY d = s.p.head<2>() - center;
+    const double r = radius_at(s);
+    const double e = d.norm() - r;
+    if (e > 3 * wall_sigma) {
+      ++outside;
+      continue;
+    }
+    scatter += d * d.transpose();
+    low = std::min(low, s.p.z());
+    high = std::max(high, s.p.z());
+    if (d.norm() > .5 * r)
+      sectors[std::clamp(static_cast<int>((std::atan2(d.y(), d.x()) + pi) / (2 * pi) * sectors.size()),
+                         0, static_cast<int>(sectors.size()) - 1)] = true;
+    if (std::abs(e) <= 2 * wall_sigma) {
+      ++inliers;
+      squared += e * e;
+    }
+    fresh += s.last >= context.stamp - top_fresh_s;
+  }
+  info.inliers = inliers;
+  info.outside = outside;
+  info.fresh = fresh;
+  info.arc = std::count(sectors.begin(), sectors.end(), true) * 2 * pi / sectors.size();
+  // A filled or a half-seen disk of the bucket's size spreads at least this much across its
+  // widest direction. A post, a head or a stray patch at the top does not.
+  const double width = std::sqrt(
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(scatter / std::max<size_t>(1, band.size() - outside))
+          .eigenvalues()[1]);
+  info.width = width;
+  if (outside > top_max_outside_ratio * band.size()) return reject("band is wider than the bucket");
+  if (inliers < c.top_min_inliers) return reject("too few wall returns");
+  if (info.arc < c.top_min_arc) return reject("wall arc too short");
+  if (width < top_min_width_m) return reject("band is narrower than the bucket");
+  if (high - low < top_min_span_ratio * c.top_band_m) return reject("wall height span too short");
+  if (fresh < 2) return reject("no current wall returns");
+  Bottom result;
+  result.center = {center.x(), center.y(), floor_z};
+  result.normal = Point::UnitZ();
+  result.radius = c.floor_radius;
+  result.boundary_residual = std::sqrt(squared / inliers);
+  result.current_points = fresh;
+  result.side_points = inliers;
+  result.score = std::log1p(inliers) + info.arc / pi - static_cast<double>(outside) / band.size();
+  info.reason = floor_known ? "fitted with known floor" : "fitted";
+  return result;
 }
 
 } // namespace lidar_perception_system::opening

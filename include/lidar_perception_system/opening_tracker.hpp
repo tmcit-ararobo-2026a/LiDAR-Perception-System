@@ -3,6 +3,7 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <cmath>
 #include <deque>
 #include <optional>
 #include <string>
@@ -50,6 +51,19 @@ struct BottomConfig {
   int shape_tracking_min_points{3};
   // Interval between full bottom searches (seconds); learned mounts are followed on every scan.
   double search_interval_s{0.1};
+  // Sparse, far or transparent buckets are fitted from the topmost part of the robot.
+  bool top_fit_enabled{true};
+  // Returns are collected in the robot frame for this long (seconds).
+  double top_window_s{3.0};
+  // Height below the rim that only the bucket may occupy (rulebook: nothing above the 2 L mark).
+  double top_band_m{0.17};
+  // Radius of the bucket floor. The opening radius is nominal_radius.
+  double floor_radius{0.1076};
+  // Radial scatter of one return: noise_per_m * range, at least noise_min_m.
+  double top_noise_per_m{0.0045}, top_noise_min_m{0.006};
+  int top_min_points{25}, top_min_inliers{15};
+  // Accumulated wall returns must cover this many radians around the axis.
+  double top_min_arc{1.75};
 };
 
 struct Config {
@@ -108,6 +122,27 @@ struct Bottom {
   int plane_points{0}, current_points{0}, side_points{0};
 };
 
+// Returns of one scan in the robot frame.
+struct TimedPoints {
+  double stamp{0};
+  Points points;
+};
+struct TopFitContext {
+  double stamp{0};  // Newest measurement time.
+  double sigma{0.01};  // Expected radial scatter at the current range (metres).
+  // A known floor height. A fit close to it reports this height and measures only XY.
+  std::optional<double> expected_floor_z;
+  // Highest height the sensor could see during the window. A top at this limit may be cut off.
+  std::optional<double> view_ceiling_z;
+};
+struct TopFitStats {
+  int band_points{0}, inliers{0}, outside{0}, fresh{0};
+  double top_z{0}, arc{0}, uncertainty{0}, width{0};
+  // Floor height implied by a rim that was fully in view.
+  std::optional<double> seen_floor_z;
+  const char* reason{"not run"};
+};
+
 // Geometry evidence only: no fixed mounting coordinates or opening inference.
 std::optional<Bottom> fit_bucket_bottom(const Points& accumulated, const Points& current,
                                         const Config& config);
@@ -119,7 +154,20 @@ std::optional<Bottom> fit_bucket_shape(const Points& accumulated, const Points& 
                                        std::optional<double> expected_z = std::nullopt);
 std::optional<Bottom> track_bucket_shape(const Bottom& learned, const Points& current,
                                          const Config& config);
-enum class BottomMode { None = 0, Direct = 1, PlaneTracked = 2, BodyInferred = 3, ShapeFitted = 4 };
+// Fit the rulebook frustum to the topmost returns of a robot, collected over several seconds.
+// It needs no visible floor or clean wall, so it works where the other fits cannot: a far,
+// transparent bucket seen almost edge-on, whose returns scatter more than the wall thickness.
+std::optional<Bottom> fit_bucket_top(const std::deque<TimedPoints>& scans,
+                                     const TopFitContext& context, const Config& config,
+                                     TopFitStats* stats = nullptr);
+enum class BottomMode {
+  None = 0,
+  Direct = 1,
+  PlaneTracked = 2,
+  BodyInferred = 3,
+  ShapeFitted = 4,
+  TopFitted = 5
+};
 
 struct FitStats {
   int max_slice_points{0}, radius_hypotheses{0}, geometry_hypotheses{0}, edge_hypotheses{0};
@@ -137,6 +185,10 @@ struct Result {
   bool motion_seeded{false};
   bool bottom_valid{false};
   bool bottom_shape_fitted{false};
+  bool bottom_top_fitted{false};
+  // This scan measured the bucket height, whichever way its position was obtained.
+  bool bottom_height_observed{false};
+  TopFitStats top_fit;
   double bottom_observation_stamp{0};
   std::optional<Bottom> bottom;
   BottomMode bottom_tracking_mode{BottomMode::None};
@@ -153,6 +205,14 @@ struct Result {
   FitStats fit;
 };
 
+// Where the sensor looks: its origin and z axis in the map frame, and its elevation limits.
+struct SensorView {
+  Point origin{0, 0, 0}, axis{0, 0, 1};
+  double min_elevation{-M_PI / 2}, max_elevation{M_PI / 2};
+  // Highest visible height above a map position, or nothing if that bearing is out of view.
+  std::optional<double> ceiling_z(const Eigen::Vector2d& target) const;
+};
+
 // Core has no ROS/GPU dependencies. All times are measurement times in seconds.
 class Tracker {
  public:
@@ -160,6 +220,8 @@ class Tracker {
   Result process(const Points& map_points, double stamp, const Eigen::Vector2d& sensor_xy);
   void reset();
   void set_exclusions(const std::vector<Eigen::Vector3d>& masks);
+  // View of the next processed scan. Unset means nothing is known to be out of view.
+  void set_sensor_view(const std::optional<SensorView>& view) { sensor_view_ = view; }
   const Points& selected_cloud() const { return selected_; }
   const Points& accumulated_cloud() const { return accumulated_; }
   const Points& body_model() const { return reference_body_; }
@@ -182,6 +244,14 @@ class Tracker {
   struct Scan {
     double stamp;
     Points points;
+  };
+  struct TopCeiling {
+    double stamp;
+    double z;
+  };
+  struct TopPose {
+    double stamp;
+    Pose pose;
   };
   struct PoseSample {
     double stamp;
@@ -214,6 +284,9 @@ class Tracker {
   void clear_model();
   void rebuild(double stamp);
   Points accumulate_scans(const Points& current, double stamp);
+  void remember_top_scan(const Points& upper, double stamp);
+  std::optional<Bottom> fit_top(double stamp, const Eigen::Vector2d& sensor_xy, TopFitStats* stats);
+  std::optional<Pose> resting_pose() const;
   void update_motion(double stamp);
   void learn_clutter(const Points& points, double stamp);
   bool is_clutter(const Point& p) const;
@@ -222,6 +295,13 @@ class Tracker {
   std::vector<Eigen::Vector3d> exclusions_;
   std::deque<Frame> frames_;
   std::deque<Scan> scans_;
+  std::deque<TimedPoints> top_scans_;
+  std::deque<TopCeiling> top_ceilings_;
+  std::deque<TopPose> top_poses_;
+  std::optional<double> top_floor_;
+  double top_floor_stamp_{0};
+  int top_floor_trend_{0}, top_floor_side_{0};
+  std::optional<SensorView> sensor_view_;
   std::deque<PoseSample> pose_history_;
   struct ClutterCell {
     double first_seen, last_seen;

@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <random>
 #include <vector>
 
 #include "lidar_perception_system/opening_tracker.hpp"
@@ -174,11 +175,66 @@ void test_static_fixture_does_not_take_the_track() {
 }
 }  // namespace
 
+// The bucket on a robot that stands 5 m away and only shows sparse, noisy returns.
+op::Points scan_bucket(const RobotPose& robot, const Eigen::Vector2d& mount, double floor,
+                       std::mt19937& rng) {
+  std::uniform_real_distribution<double> unit(0, 1);
+  std::normal_distribution<double> noise(0, .022);
+  op::Points points;
+  const op::Config c;
+  const Eigen::Vector2d axis =
+      Eigen::Vector2d(robot.x, robot.y) + Eigen::Rotation2Dd(robot.yaw) * mount;
+  for (int i = 0; i < 2; ++i) {
+    const double height = .06 + unit(rng) * (c.bottom.bucket_height - .06);
+    const double radius = c.bottom.floor_radius +
+                          (c.nominal_radius - c.bottom.floor_radius) * height / c.bottom.bucket_height;
+    const double bearing = unit(rng) * 2 * M_PI;
+    const double r = unit(rng) < .3 ? radius * std::sqrt(unit(rng)) : radius + noise(rng);
+    points.emplace_back(axis.x() + r * std::cos(bearing), axis.y() + r * std::sin(bearing),
+                        floor + height);
+  }
+  return points;
+}
+
+void test_far_bucket_is_recognized() {
+  op::Config c = config();
+  op::Tracker tracker(c);
+  double stamp = 1;
+  int scan = 0;
+  RobotPose robot{0, 0, 0};
+  acquire(tracker, stamp, robot, scan, 1.);
+  std::mt19937 rng(5);
+  const Eigen::Vector2d mount(.1, .05);
+  const double floor = 1.25;
+  op::Result last;
+  double first_valid = -1;
+  const double start = stamp;
+  for (; stamp - start < 8; stamp += scan_dt, ++scan) {
+    auto points = scan_robot(robot, scan);
+    const auto bucket = scan_bucket(robot, mount, floor, rng);
+    points.insert(points.end(), bucket.begin(), bucket.end());
+    const auto result = tracker.process(points, stamp, sensor);
+    if (result.bottom_valid && first_valid < 0) first_valid = stamp - start;
+    if (result.bottom_valid) last = result;
+  }
+  check(first_valid >= 0, "a far bucket on a standing robot is recognized");
+  check(first_valid < 5, "it is recognized within a few seconds");
+  check(last.bottom_tracking_mode == op::BottomMode::TopFitted, "it comes from the top fit");
+  if (last.bottom) {
+    const op::Point world = last.pose.world(last.bottom->center);
+    const Eigen::Vector2d truth =
+        Eigen::Vector2d(robot.x, robot.y) + Eigen::Rotation2Dd(robot.yaw) * mount;
+    check((world.head<2>() - truth).norm() < .05, "its position is right within 5 cm");
+    check(std::abs(world.z() - floor) < .04, "its floor height is right within 4 cm");
+  }
+}
+
 int main() {
   test_tracks_continuously();
   test_recovers_after_short_occlusion_with_turn();
   test_reidentifies_after_track_timeout();
   test_static_fixture_does_not_take_the_track();
+  test_far_bucket_is_recognized();
   if (failures) return 1;
   std::cout << "opening_tracker_test passed\n";
   return 0;
