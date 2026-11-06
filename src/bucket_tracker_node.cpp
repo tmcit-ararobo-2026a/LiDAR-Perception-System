@@ -407,17 +407,34 @@ class BucketTracker : public rclcpp::Node {
     const double age =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - item.received).count();
     geometry_msgs::msg::TransformStamped transform;
+    bool got_transform = false;
     try {
       transform = buffer_->lookupTransform(frame_, item.cloud->header.frame_id,
                                            rclcpp::Time(item.cloud->header.stamp),
                                            rclcpp::Duration::from_seconds(0));
+      got_transform = true;
     } catch (const tf2::TransformException&) {
-      if (age >= tf_wait_s_) {
-        queue_.pop_front();
-        ++tf_drops_;
-        invalid(item.cloud->header, "TF unavailable");
+      if (age >= tf_wait_s_ || queue_.size() > 2) {
+        try {
+          transform = buffer_->lookupTransform(frame_, item.cloud->header.frame_id,
+                                               tf2::TimePointZero);
+          const double tf_age = std::abs((rclcpp::Time(transform.header.stamp) -
+                                          rclcpp::Time(item.cloud->header.stamp)).seconds());
+          if (tf_age < 0.2) {
+            got_transform = true;
+          }
+        } catch (const tf2::TransformException&) {
+        }
+
+        if (!got_transform) {
+          queue_.pop_front();
+          ++tf_drops_;
+          invalid(item.cloud->header, "TF unavailable");
+          return;
+        }
+      } else {
+        return;
       }
-      return;
     }
     queue_.pop_front();
     const auto started = std::chrono::steady_clock::now();
