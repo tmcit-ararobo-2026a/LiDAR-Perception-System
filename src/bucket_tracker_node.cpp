@@ -552,8 +552,8 @@ class BucketTracker : public rclcpp::Node {
     t.track_id = r.track_id;
     t.last_observation_stamp = previous_stamp;
     const double age = (now() - rclcpp::Time(header.stamp)).seconds();
-    t.valid = r.body_valid && geometry && mode != op::BottomMode::None && age >= -.05 &&
-              age <= cfg_.prediction_s;
+    t.valid = (r.body_valid || r.bottom_followed_without_body) && geometry &&
+              mode != op::BottomMode::None && age >= -.05 && age <= cfg_.prediction_s;
     if (!t.valid) return t;
     const auto& b = *geometry;
     t.observation_mode = static_cast<uint8_t>(mode);

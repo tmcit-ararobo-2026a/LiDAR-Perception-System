@@ -142,6 +142,8 @@ struct TopFitStats {
   double top_z{0}, arc{0}, uncertainty{0}, width{0};
   // Floor height the fit used, when it was known or the rim was fully in view.
   std::optional<double> seen_floor_z;
+  // The returns were brought along a guess that follows the bucket's lift.
+  bool traced{false};
   const char* reason{"not run"};
 };
 
@@ -193,6 +195,8 @@ struct Result {
   double rim_height{0}, rim_speed{0};
   // The horizontal position of the tracked bottom comes from the bucket itself, not the chassis pose.
   bool bottom_axis_followed{false};
+  // The chassis was not registered on this scan, but the bucket was followed from its own returns.
+  bool bottom_followed_without_body{false};
   TopFitStats top_fit;
   double bottom_observation_stamp{0};
   std::optional<Bottom> bottom;
@@ -232,6 +236,11 @@ class Tracker {
   const Points& body_model() const { return reference_body_; }
   size_t upper_body_model_points() const { return reference_upper_.size(); }
   unsigned int height_resets() const { return height_resets_; }
+  // The guessed bucket axis and rim before the bucket is recognized, for diagnostics.
+  std::optional<Eigen::Vector3d> candidate() const {
+    if (!candidate_axis_.ready()) return std::nullopt;
+    return Eigen::Vector3d(candidate_axis_.axis().x(), candidate_axis_.axis().y(), candidate_rim_.rim());
+  }
   std::optional<Opening> fit_opening(const Points& accumulated, const Points& current,
                                      FitStats* stats = nullptr) const;
 
@@ -264,6 +273,13 @@ class Tracker {
     double stamp;
     Pose pose;
   };
+  // Top returns in the map frame, with where the guessed bucket was when they came.
+  struct TopTrace {
+    double stamp;
+    Points points;
+    std::optional<Eigen::Vector2d> axis;
+    double rim{0};
+  };
   struct LostModel {
     std::optional<Eigen::Vector2d> anchor;
     int anchor_hits{0};
@@ -288,11 +304,22 @@ class Tracker {
                      double& overlap, Points* supported = nullptr, bool use_upper = false) const;
   std::optional<Reidentification> reidentify(const std::vector<Cluster>& candidates, double stamp);
   Result missing(double stamp, const std::string& reason, Result result = Result{});
-  void clear_model();
+  // A guess at the bucket still being hit outlives the track of its chassis, as it needs no pose.
+  void clear_model(bool keep_guess = false);
   void rebuild(double stamp);
   Points accumulate_scans(const Points& current, double stamp);
   void remember_top_scan(const Points& upper, double stamp);
   void follow_rim(const Points& upper, double stamp, const Eigen::Vector2d& sensor_xy, Result& result);
+  std::vector<double> rim_heights(const Points& upper, const Eigen::Vector2d& axis,
+                                  const std::optional<Eigen::Vector2d>& other,
+                                  std::unordered_map<VoxelKey, double, VoxelKeyHash>& recent,
+                                  double stamp) const;
+  void follow_candidate(const Points& filtered, const Points& upper, double stamp,
+                        const Eigen::Vector2d& sensor_xy);
+  void clear_candidate();
+  void remember_trace(double stamp);
+  void follow_without_body(const Points& filtered, double stamp, const Eigen::Vector2d& sensor_xy,
+                           Result& result);
   std::optional<Bottom> fit_top(double stamp, const Eigen::Vector2d& sensor_xy, TopFitStats* stats);
   std::optional<Pose> resting_pose() const;
   void update_motion(double stamp);
@@ -309,6 +336,12 @@ class Tracker {
   RimHeightFilter rim_filter_;
   BucketAxisFilter axis_filter_;
   std::unordered_map<VoxelKey, double, VoxelKeyHash> rim_recent_;
+  // Before the bucket is recognized, its rim and axis are followed from a guess, so that the returns
+  // of a moving robot can be gathered where the bucket is now.
+  RimHeightFilter candidate_rim_;
+  BucketAxisFilter candidate_axis_;
+  std::unordered_map<VoxelKey, double, VoxelKeyHash> candidate_recent_;
+  std::deque<TopTrace> top_traces_;
   std::optional<SensorView> sensor_view_;
   std::deque<PoseSample> pose_history_;
   struct ClutterCell {

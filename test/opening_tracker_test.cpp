@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -259,6 +260,364 @@ void test_bucket_lift_is_followed() {
   check(largest_error > 0, "the height was checked during the lift");
 }
 
+// A round chassis shows no heading, so its registered pose cannot follow it as it turns. A bucket
+// mounted off its centre then circles in the robot frame, as it does on a real robot seen in part.
+op::Points scan_round_robot(const RobotPose& robot, int scan) {
+  op::Points points;
+  constexpr double radius = .35;
+  const Eigen::Vector2d center(robot.x, robot.y);
+  for (int i = 0; i < 32; ++i) {
+    const double bearing = 2 * M_PI * (i + .5) / 32;
+    const Eigen::Vector2d outward(std::cos(bearing), std::sin(bearing));
+    const Eigen::Vector2d p = center + radius * outward;
+    if (outward.dot(sensor - p) <= 0) continue;
+    for (int level = 0; level < 5; ++level)
+      if ((i + level + scan) % 2 == 0) points.emplace_back(p.x(), p.y(), .25 + .15 * level);
+  }
+  return points;
+}
+
+// The robot keeps moving and turning while its bucket lifts, so the bucket's returns pile up neither in
+// the robot frame nor in the map. A guess at the bucket must follow it before a fit can see it.
+struct TurningRun {
+  double first_guess{-1}, first_valid{-1}, guess_error{0}, xy_error{1}, z_error{1};
+  // Worst error of the tracked bottom in the first half second after recognition, and after that.
+  double early_xy{0}, followed_xy{0}, followed_z{0};
+};
+TurningRun run_turning_robot(unsigned seed, double lift_rate = 1, double lift = .15) {
+  op::Tracker tracker(config());
+  double stamp = 1;
+  int scan = 0;
+  RobotPose robot{-2, 0, 0};
+  std::mt19937 rng(seed);
+  const Eigen::Vector2d mount(.25, 0);
+  TurningRun run;
+  double &first_guess = run.first_guess, &first_valid = run.first_valid, &guess_error = run.guess_error,
+         &xy_error = run.xy_error, &z_error = run.z_error;
+  for (double t = 0; t < 6; t += scan_dt, stamp += scan_dt, ++scan) {
+    robot.x += .5 * scan_dt;
+    robot.yaw += 1. * scan_dt;
+    const double floor = 1.25 + lift * std::sin(lift_rate * t);
+    auto points = scan_round_robot(robot, scan);
+    const auto bucket = scan_bucket(robot, mount, floor, rng);
+    points.insert(points.end(), bucket.begin(), bucket.end());
+    const auto result = tracker.process(points, stamp, sensor);
+    const Eigen::Vector2d truth =
+        Eigen::Vector2d(robot.x, robot.y) + Eigen::Rotation2Dd(robot.yaw) * mount;
+    if (const auto guess = tracker.candidate()) {
+      if (first_guess < 0) first_guess = t;
+      if (t - first_guess > 1)
+        guess_error = std::max(guess_error, (guess->head<2>() - truth).norm());
+    }
+    if (result.bottom_valid && first_valid < 0) {
+      first_valid = t;
+      const op::Point world = result.pose.world(result.bottom->center);
+      xy_error = (world.head<2>() - truth).norm();
+      z_error = std::abs(world.z() - floor);
+    }
+    if (first_valid >= 0 && result.tracked_bottom) {
+      const op::Point world = result.pose.world(result.tracked_bottom->center);
+      const double e = (world.head<2>() - truth).norm();
+      if (t - first_valid < .5) {
+        run.early_xy = std::max(run.early_xy, e);
+      } else {
+        run.followed_xy = std::max(run.followed_xy, e);
+        run.followed_z = std::max(run.followed_z, std::abs(world.z() - floor));
+      }
+    }
+  }
+  return run;
+}
+void test_bucket_on_turning_robot_is_recognized() {
+  TurningRun worst;
+  worst.xy_error = worst.z_error = 0;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    const auto run = run_turning_robot(seed);
+    std::cout << "turning robot, seed " << seed << ": guess at " << run.first_guess
+              << " s, worst guess error " << run.guess_error << " m, recognized at " << run.first_valid
+              << " s, error " << run.xy_error << " m, " << run.z_error << " m, then " << run.early_xy
+              << " m, " << run.followed_xy << " m, " << run.followed_z << " m\n";
+    worst.first_guess = run.first_guess < 0 ? 99 : std::max(worst.first_guess, run.first_guess);
+    worst.first_valid = run.first_valid < 0 ? 99 : std::max(worst.first_valid, run.first_valid);
+    worst.guess_error = std::max(worst.guess_error, run.guess_error);
+    worst.xy_error = std::max(worst.xy_error, run.xy_error);
+    worst.z_error = std::max(worst.z_error, run.z_error);
+    worst.early_xy = std::max(worst.early_xy, run.early_xy);
+    worst.followed_xy = std::max(worst.followed_xy, run.followed_xy);
+    worst.followed_z = std::max(worst.followed_z, run.followed_z);
+  }
+  std::cout << "turning robot, worst: recognized at " << worst.first_valid << " s, then " << worst.early_xy
+            << " m, " << worst.followed_xy << " m, " << worst.followed_z << " m\n";
+  check(worst.first_guess < 1, "a guess at the bucket starts within 1 s");
+  check(worst.guess_error < .08, "the guess follows the bucket within 8 cm");
+  check(worst.first_valid < 2, "the bucket on a turning robot is recognized within 2 s");
+  check(worst.xy_error < .07, "it is recognized where it is, within 7 cm");
+  check(worst.z_error < .05, "and at its height, within 5 cm");
+  check(worst.early_xy < .068, "the followed axis carries on from the fit, within 6.8 cm");
+  check(worst.followed_z < .075, "its height then follows the lift within 7.5 cm");
+  // Fits during a lift of up to 0.9 m/s differ in height by more than fits of a still bucket do, and the
+  // guess that follows the lift accounts for that.
+  double fast = 0;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    const auto run = run_turning_robot(seed, 3, .3);
+    fast = std::max(fast, run.first_valid < 0 ? 99. : run.first_valid);
+  }
+  std::cout << "turning robot, fast lift: recognized at worst " << fast << " s\n";
+  check(fast < 2.3, "a bucket lifting fast on a turning robot is recognized within 2.3 s");
+}
+
+// Something held above the bucket for a moment, such as a ball, is the top of the robot while it lasts.
+// A guess that started on it finds nothing there afterwards and must start over on the bucket.
+void test_guess_starts_over_after_a_passing_object() {
+  int failed = 0;
+  double worst = 0;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    op::Tracker tracker(config());
+    double stamp = 1;
+    int scan = 0;
+    RobotPose robot{-2, 0, 0};
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> noise(0, .02);
+    // On opposite sides of the robot, further apart than a guess looks for its bucket.
+    const Eigen::Vector2d mount(.3, .3), elsewhere(-.6, 0);
+    double first_valid = -1;
+    for (double t = 0; t < 6; t += scan_dt, stamp += scan_dt, ++scan) {
+      robot.x += .5 * scan_dt;
+      robot.yaw += 1. * scan_dt;
+      auto points = scan_round_robot(robot, scan);
+      if (t < .6) {
+        const Eigen::Vector2d held =
+            Eigen::Vector2d(robot.x, robot.y) + Eigen::Rotation2Dd(robot.yaw) * elsewhere;
+        for (int i = 0; i < 6; ++i)
+          points.emplace_back(held.x() + noise(rng), held.y() + noise(rng), 1.95 + noise(rng));
+      }
+      const auto bucket = scan_bucket(robot, mount, 1.25, rng);
+      points.insert(points.end(), bucket.begin(), bucket.end());
+      const auto result = tracker.process(points, stamp, sensor);
+      if (result.bottom_valid && first_valid < 0) first_valid = t;
+    }
+    failed += first_valid < 0;
+    worst = std::max(worst, first_valid < 0 ? 99. : first_valid);
+  }
+  std::cout << "passing object: recognized at worst " << worst << " s\n";
+  check(!failed && worst < 3, "the bucket is recognized after an object above it has gone");
+}
+
+// A standing robot is recognized from a fit in its own frame. The guess that followed the bucket until
+// then has settled, so the followed axis carries on from it rather than from the fit alone.
+void test_recognized_bucket_carries_on_steadily() {
+  double worst = 0;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    op::Tracker tracker(config());
+    double stamp = 1;
+    int scan = 0;
+    RobotPose robot{0, 0, 0};
+    acquire(tracker, stamp, robot, scan, 1.);
+    std::mt19937 rng(seed);
+    const Eigen::Vector2d mount(.1, .05);
+    double first_valid = -1, path = 0;
+    std::optional<Eigen::Vector2d> last;
+    const double start = stamp;
+    for (; stamp - start < 8; stamp += scan_dt, ++scan) {
+      auto points = scan_robot(robot, scan);
+      const auto bucket = scan_bucket(robot, mount, 1.25, rng);
+      points.insert(points.end(), bucket.begin(), bucket.end());
+      const auto result = tracker.process(points, stamp, sensor);
+      if (result.bottom_valid && first_valid < 0) first_valid = stamp;
+      if (first_valid < 0 || stamp - first_valid > 1 || !result.tracked_bottom) continue;
+      const Eigen::Vector2d xy = result.pose.world(result.tracked_bottom->center).head<2>();
+      if (last) path += (xy - *last).norm();
+      last = xy;
+    }
+    worst = std::max(worst, first_valid < 0 ? 99. : path);
+  }
+  std::cout << "standing robot: path of the bucket in its first second, at worst " << worst << " m\n";
+  check(worst < .3, "a recognized standing bucket moves little in its first second");
+}
+
+// A far robot is registered only now and then, while the top of its bucket keeps returning. The bucket
+// is followed from those returns meanwhile, and stays reported where it is.
+void test_bucket_is_followed_while_the_chassis_is_unseen() {
+  double worst = 0, reported = 1;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    op::Tracker tracker(config());
+    double stamp = 1;
+    int scan = 0;
+    RobotPose robot{-2, 0, 0};
+    std::mt19937 rng(seed);
+    const Eigen::Vector2d mount(.25, 0);
+    double first_valid = -1;
+    int gap_frames = 0, gap_followed = 0;
+    for (double t = 0; t < 6; t += scan_dt, stamp += scan_dt, ++scan) {
+      robot.x += .5 * scan_dt;
+      robot.yaw += 1. * scan_dt;
+      const bool gap = first_valid >= 0 && t > first_valid + 1 && t < first_valid + 2;
+      op::Points points;
+      if (!gap) points = scan_round_robot(robot, scan);
+      const auto bucket = scan_bucket(robot, mount, 1.25, rng);
+      points.insert(points.end(), bucket.begin(), bucket.end());
+      const auto result = tracker.process(points, stamp, sensor);
+      if (result.bottom_valid && first_valid < 0) first_valid = t;
+      if (!gap) continue;
+      ++gap_frames;
+      if (!result.bottom_followed_without_body || !result.tracked_bottom) continue;
+      ++gap_followed;
+      const Eigen::Vector2d truth =
+          Eigen::Vector2d(robot.x, robot.y) + Eigen::Rotation2Dd(robot.yaw) * mount;
+      const Eigen::Vector2d seen = result.pose.world(result.tracked_bottom->center).head<2>();
+      worst = std::max(worst, (seen - truth).norm());
+    }
+    reported = std::min(reported, gap_frames ? static_cast<double>(gap_followed) / gap_frames : 0.);
+  }
+  std::cout << "unseen chassis: bucket reported in at least " << reported << " of the gap, worst error "
+            << worst << " m\n";
+  check(reported > .8, "the bucket stays reported while the chassis is unseen");
+  check(worst < .08, "and where it is, within 8 cm");
+  // With the bucket gone from view as well, nothing shows where it is, and it is not reported for long.
+  double longest = 0;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    op::Tracker tracker(config());
+    double stamp = 1;
+    int scan = 0;
+    RobotPose robot{-2, 0, 0};
+    std::mt19937 rng(seed);
+    const Eigen::Vector2d mount(.25, 0);
+    double first_valid = -1, hidden_since = -1, last_reported = -1;
+    for (double t = 0; t < 6; t += scan_dt, stamp += scan_dt, ++scan) {
+      robot.x += .5 * scan_dt;
+      robot.yaw += 1. * scan_dt;
+      const bool gap = first_valid >= 0 && t > first_valid + 1 && t < first_valid + 2;
+      if (gap && hidden_since < 0) hidden_since = t;
+      op::Points points;
+      if (!gap) {
+        points = scan_round_robot(robot, scan);
+        const auto bucket = scan_bucket(robot, mount, 1.25, rng);
+        points.insert(points.end(), bucket.begin(), bucket.end());
+      }
+      const auto result = tracker.process(points, stamp, sensor);
+      if (result.bottom_valid && first_valid < 0) first_valid = t;
+      if (gap && result.bottom_followed_without_body) last_reported = t;
+    }
+    if (hidden_since >= 0) longest = std::max(longest, last_reported < 0 ? 0. : last_reported - hidden_since);
+  }
+  std::cout << "hidden robot: bucket reported for at most " << longest << " s\n";
+  check(longest < .4, "a bucket out of view is not reported for long");
+}
+
+// A track that loses its chassis for longer than it lives starts over, but the guess at its bucket is still
+// being hit and needs no pose. It carries on, so the new track recognizes the bucket at once.
+void test_guess_outlives_a_lost_track() {
+  double worst = 0;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    op::Tracker tracker(config());
+    double stamp = 1;
+    int scan = 0;
+    RobotPose robot{-2, 0, 0};
+    std::mt19937 rng(seed);
+    const Eigen::Vector2d mount(.25, 0);
+    double first_valid = -1;
+    for (double t = 0; t < 6; t += scan_dt, stamp += scan_dt, ++scan) {
+      robot.x += .5 * scan_dt;
+      robot.yaw += 1. * scan_dt;
+      // Seen for a moment, then unseen for longer than a track lasts.
+      op::Points points;
+      if (t < .3 || t > 2.8) points = scan_round_robot(robot, scan);
+      const auto bucket = scan_bucket(robot, mount, 1.25, rng);
+      points.insert(points.end(), bucket.begin(), bucket.end());
+      const auto result = tracker.process(points, stamp, sensor);
+      if (result.bottom_valid && first_valid < 0) first_valid = t;
+    }
+    worst = std::max(worst, first_valid < 0 ? 99. : first_valid - 2.8);
+  }
+  std::cout << "lost track: recognized at worst " << worst << " s after the chassis reappeared\n";
+  check(worst < .6, "a guess that outlived its track gives the new one the bucket at once");
+}
+
+// A transparent bucket returns mostly from inside and below its rim, so a short window can miss its top.
+op::Points scan_clear_bucket(const RobotPose& robot, const Eigen::Vector2d& mount, double floor,
+                             std::mt19937& rng) {
+  std::uniform_real_distribution<double> unit(0, 1);
+  std::normal_distribution<double> noise(0, .015);
+  op::Points points;
+  const op::Config c;
+  const Eigen::Vector2d axis =
+      Eigen::Vector2d(robot.x, robot.y) + Eigen::Rotation2Dd(robot.yaw) * mount;
+  for (int i = 0; i < 2; ++i) {
+    const double height = .06 + std::pow(unit(rng), 2.) * (c.bottom.bucket_height - .06);
+    const double radius = c.bottom.floor_radius +
+                          (c.nominal_radius - c.bottom.floor_radius) * height / c.bottom.bucket_height;
+    const double bearing = unit(rng) * 2 * M_PI;
+    const double r = unit(rng) < .6 ? radius * std::sqrt(unit(rng)) : radius + noise(rng);
+    points.emplace_back(axis.x() + r * std::cos(bearing), axis.y() + r * std::sin(bearing),
+                        floor + height);
+  }
+  return points;
+}
+
+// A still bucket gives its guess time, so a fit that disagrees with the guess has not seen the rim yet.
+// Here the track starts over while the robot stands, so its frame has no rest, and the fit along the
+// guess runs on a short window.
+void test_still_bucket_is_recognized_at_its_height() {
+  double worst = 0;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    op::Tracker tracker(config());
+    double stamp = 1;
+    int scan = 0;
+    RobotPose robot{0, 0, 0};
+    acquire(tracker, stamp, robot, scan, 1.);
+    std::mt19937 rng(seed);
+    const Eigen::Vector2d mount(.1, .05);
+    constexpr double floor = 1.25;
+    for (double t = 0; t < 2.5; t += scan_dt, stamp += scan_dt, ++scan)
+      tracker.process(scan_clear_bucket(robot, mount, floor, rng), stamp, sensor);
+    const double start = stamp;
+    for (; stamp - start < 5; stamp += scan_dt, ++scan) {
+      auto points = scan_robot(robot, scan);
+      const auto bucket = scan_clear_bucket(robot, mount, floor, rng);
+      points.insert(points.end(), bucket.begin(), bucket.end());
+      const auto result = tracker.process(points, stamp, sensor);
+      if (result.bottom_valid && result.tracked_bottom) {
+        worst = std::max(worst, std::abs(result.pose.world(result.tracked_bottom->center).z() - floor));
+        break;
+      }
+    }
+  }
+  std::cout << "still clear bucket: worst height at recognition " << worst << " m\n";
+  check(worst < .05, "a still bucket is recognized at its height, within 5 cm");
+}
+
+// A kept guess belongs to whichever robot the next track finds only if it is on that robot. Here the first
+// robot's chassis is lost behind something while its bucket stays in view, and another robot appears.
+void test_kept_guess_stays_with_its_robot() {
+  double nearest = 99;
+  for (unsigned seed = 7; seed < 15; ++seed) {
+    op::Tracker tracker(config());
+    double stamp = 1;
+    int scan = 0;
+    RobotPose first{-2, 0, 0}, other{1.5, 1.5, .3};
+    std::mt19937 rng(seed);
+    const Eigen::Vector2d mount(.25, 0);
+    for (double t = 0; t < 6; t += scan_dt, stamp += scan_dt, ++scan) {
+      first.x += .3 * scan_dt;
+      first.yaw += 1. * scan_dt;
+      op::Points points;
+      if (t < .3) points = scan_round_robot(first, scan);
+      if (t > 2.8) points = scan_robot(other, scan);
+      const auto bucket = scan_bucket(first, mount, 1.25, rng);
+      points.insert(points.end(), bucket.begin(), bucket.end());
+      const auto result = tracker.process(points, stamp, sensor);
+      if (!result.bottom_valid || !result.bottom) continue;
+      const Eigen::Vector2d bucket_axis =
+          Eigen::Vector2d(first.x, first.y) + Eigen::Rotation2Dd(first.yaw) * mount;
+      const Eigen::Vector2d seen = result.pose.world(result.bottom->center).head<2>();
+      nearest = std::min(nearest, (seen - bucket_axis).norm());
+    }
+  }
+  std::cout << "kept guess on another robot: closest recognized bucket to the first robot's " << nearest
+            << " m\n";
+  check(nearest > .5, "a guess is not handed to another robot");
+}
+
 int main() {
   test_tracks_continuously();
   test_recovers_after_short_occlusion_with_turn();
@@ -266,6 +625,13 @@ int main() {
   test_static_fixture_does_not_take_the_track();
   test_far_bucket_is_recognized();
   test_bucket_lift_is_followed();
+  test_bucket_on_turning_robot_is_recognized();
+  test_guess_starts_over_after_a_passing_object();
+  test_recognized_bucket_carries_on_steadily();
+  test_bucket_is_followed_while_the_chassis_is_unseen();
+  test_guess_outlives_a_lost_track();
+  test_still_bucket_is_recognized_at_its_height();
+  test_kept_guess_stays_with_its_robot();
   if (failures) return 1;
   std::cout << "opening_tracker_test passed\n";
   return 0;

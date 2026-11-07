@@ -72,6 +72,10 @@ class BucketAxisFilter {
   }
   Eigen::Vector2d axis() const { return state_.head<2>(); }
   Eigen::Vector2d velocity() const { return state_.tail<2>(); }
+  // When a return last hit the top strip.
+  double last_hit() const { return last_hit_; }
+  // Move the axis to a better fix, keeping its speed.
+  void place(const Eigen::Vector2d& axis) { state_.head<2>() = axis; }
 
  private:
   struct Scan {
