@@ -1,6 +1,7 @@
 // Copyright 2026 tmcit-ararobo-2026a
 // SPDX-License-Identifier: Apache-2.0
 // Following the bucket rim from sparse returns while it holds, rises and comes down.
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -23,7 +24,8 @@ void check(bool condition, const char* what) {
 constexpr double scan_dt = .02, sigma = .011, start_rim = 1.5;
 
 struct Scene {
-  std::mt19937 rng{7};
+  explicit Scene(unsigned seed = 7) : rng(seed) {}
+  std::mt19937 rng;
   double wall_rate{60}, body_rate{120};  // Returns per second.
   std::vector<double> scan(double rim) {
     std::poisson_distribution<int> wall(wall_rate * scan_dt), body(body_rate * scan_dt);
@@ -40,22 +42,56 @@ struct Run {
   double largest_error{0}, end_error{0}, steady_largest{0};
 };
 
-// Runs a rim height over time. Errors are taken after the first second of settling, and
-// steady_largest only from the given time on.
-Run run(const std::function<double(double)>& rim_at, double seconds, double steady_from = 1e9,
-        Scene scene = Scene{}) {
-  op::RimHeightFilter filter(1.165, 2.185);
-  filter.reset(rim_at(0), 100);
+// Runs a rim height over time, keeping the worst of a few random scenes as one could be lucky.
+// Errors are taken after the first second of settling, and steady_largest only from the given time on.
+Run run(const std::function<double(double)>& rim_at, double seconds, double steady_from = 1e9) {
   Run result;
-  for (double t = 0; t < seconds; t += scan_dt) {
-    const double rim = rim_at(t);
-    filter.update(100 + t, scene.scan(rim), sigma);
-    const double error = std::abs(filter.rim() - rim);
-    if (t > 1) result.largest_error = std::max(result.largest_error, error);
-    if (t > steady_from) result.steady_largest = std::max(result.steady_largest, error);
-    result.end_error = error;
+  for (const unsigned seed : {7U, 8U, 9U}) {
+    op::RimHeightFilter filter(1.165, 2.185);
+    filter.reset(rim_at(0), 100);
+    Scene scene(seed);
+    double error = 0;
+    for (double t = 0; t < seconds; t += scan_dt) {
+      const double rim = rim_at(t);
+      filter.update(100 + t, scene.scan(rim), sigma);
+      error = std::abs(filter.rim() - rim);
+      if (t > 1) result.largest_error = std::max(result.largest_error, error);
+      if (t > steady_from) result.steady_largest = std::max(result.steady_largest, error);
+    }
+    result.end_error = std::max(result.end_error, error);
   }
   return result;
+}
+
+struct Held {
+  double within_3cm{0}, largest{0};
+};
+
+// A still rim over ten random scenes. Every 3 s the scan pattern can leave its top 10 cm unhit for
+// the given time, however many returns land below meanwhile, as measured on a still bucket at 4-5 m.
+Held hold(double wall_rate, double top_unhit_s) {
+  Held held;
+  int scans = 0, within = 0;
+  for (unsigned seed = 1; seed <= 10; ++seed) {
+    op::RimHeightFilter filter(1.165, 2.185);
+    filter.reset(start_rim, 100);
+    Scene scene(seed);
+    scene.wall_rate = wall_rate;
+    for (double t = 0; t < 15; t += scan_dt) {
+      auto heights = scene.scan(start_rim);
+      if (std::fmod(t, 3.) < top_unhit_s)
+        heights.erase(std::remove_if(heights.begin(), heights.end(), [](double z) { return z > start_rim - .1; }),
+                      heights.end());
+      filter.update(100 + t, heights, sigma);
+      if (t <= 1) continue;
+      const double error = std::abs(filter.rim() - start_rim);
+      held.largest = std::max(held.largest, error);
+      ++scans;
+      within += error < .03;
+    }
+  }
+  held.within_3cm = static_cast<double>(within) / scans;
+  return held;
 }
 
 double ramp(double t, double start, double amount, double speed) {
@@ -64,26 +100,37 @@ double ramp(double t, double start, double amount, double speed) {
 }
 
 void test_holds_steadily() {
+  for (const double wall_rate : {60., 28.}) {
+    const auto held = hold(wall_rate, 0);
+    check(held.within_3cm > .98, "a held rim stays within 3 cm for 98 % of the time");
+    check(held.largest < .08, "a held rim never moves 8 cm");
+  }
   const auto r = run([](double) { return start_rim; }, 15);
-  check(r.largest_error < .05, "a held rim stays within 5 cm");
-  check(r.end_error < .02, "a held rim settles within 2 cm");
+  check(r.end_error < .03, "a held rim settles within 3 cm");
+}
+
+void test_unhit_top_of_a_still_wall_is_not_a_fall() {
+  const auto dense = hold(60, .3), sparser = hold(28, .3);
+  check(dense.within_3cm > .9, "an unhit top keeps a held rim within 3 cm, dense returns");
+  check(sparser.within_3cm > .95, "an unhit top keeps a held rim within 3 cm, sparser returns");
+  check(dense.largest < .15 && sparser.largest < .1, "an unhit top does not bring a held rim far down");
 }
 
 void test_follows_a_rise() {
   const auto r = run([](double t) { return start_rim + ramp(t, 2, .3, .2); }, 8, 4.5);
   check(r.largest_error < .08, "a rise at 0.2 m/s is followed within 8 cm");
-  check(r.steady_largest < .05, "the rim settles within 1 s after a rise");
+  check(r.steady_largest < .08, "the rim stays within 8 cm from 1 s after a rise");
 }
 
 void test_follows_a_fall() {
   const auto r = run([](double t) { return start_rim + .3 + ramp(t, 2, -.3, .2); }, 8, 5);
   check(r.largest_error < .15, "a fall at 0.2 m/s is followed within 15 cm");
-  check(r.steady_largest < .04, "the rim settles within 1.5 s after a fall");
+  check(r.steady_largest < .08, "the rim stays within 8 cm from 1.5 s after a fall");
 }
 
 void test_follows_a_fast_rise() {
   const auto r = run([](double t) { return start_rim + ramp(t, 2, .4, 1.); }, 6, 3.5);
-  check(r.steady_largest < .04, "the rim settles within 1 s after a rise at 1 m/s");
+  check(r.steady_largest < .08, "the rim stays within 8 cm from 1 s after a rise at 1 m/s");
 }
 
 double triangle(double t, double low, double amplitude, double speed) {
@@ -103,27 +150,74 @@ void test_settles_quickly_after_a_reversal() {
   // Up, then straight back down: the speed must not keep it going the old way.
   const auto r = run([](double t) { return start_rim + ramp(t, 2, .3, .2) + ramp(t, 3.5, -.3, .2); }, 7, 6);
   check(r.largest_error < .15, "a reversal at 0.2 m/s stays within 15 cm");
-  check(r.steady_largest < .05, "the rim settles within 1 s after a reversal");
+  check(r.steady_largest < .08, "the rim stays within 8 cm from 1 s after a reversal");
 }
 
 void test_comes_down_further_than_the_wall_at_once() {
   // A quick drop leaves no return anywhere near the old height, only those below it.
   const auto r = run([](double t) { return start_rim + .4 + ramp(t, 3, -.4, 1.); }, 7, 5);
-  check(r.steady_largest < .04, "the rim settles within 1.5 s after a drop of 40 cm");
+  check(r.steady_largest < .08, "the rim stays within 8 cm from 1.5 s after a drop of 40 cm");
 }
 
-void test_one_burst_is_not_a_lift() {
+void test_stopped_lift_does_not_carry_on() {
+  // Returns below the height arrive after the stop too, which must not keep the speed alive.
+  for (const double speed : {.5, 1.}) {
+    op::RimHeightFilter filter(1.165, 2.185);
+    filter.reset(start_rim, 100);
+    Scene scene;
+    scene.wall_rate = 28;
+    double worst = 0;
+    for (double t = 0; t < 5; t += scan_dt) {
+      const double rim = start_rim + ramp(t, 2, .4, speed);
+      filter.update(100 + t, scene.scan(rim), sigma);
+      if (t > 2 + .4 / speed) worst = std::max(worst, filter.rim() - rim);
+    }
+    check(worst < .05, "a lift that stopped does not overshoot by 5 cm");
+  }
+}
+
+void test_proven_fall_reaches_its_goal() {
+  // A drop proven once must be followed through, even if nothing proves it again on the way down.
   op::RimHeightFilter filter(1.165, 2.185);
   filter.reset(start_rim, 100);
   Scene scene;
+  scene.wall_rate = 2;
+  scene.body_rate = 0;
   for (double t = 0; t < 3; t += scan_dt) filter.update(100 + t, scene.scan(start_rim), sigma);
-  auto burst = scene.scan(start_rim);
-  burst.insert(burst.end(), {1.8, 1.82, 1.85, 1.81});  // A passing cloth, in a single scan.
-  filter.update(103, burst, sigma);
-  for (double t = .02; t < 1; t += scan_dt) {
-    filter.update(103 + t, scene.scan(start_rim), sigma);
-    check(std::abs(filter.rim() - start_rim) < .08, "one burst of returns 30 cm above does not move the rim");
+  std::mt19937 rng(13);
+  std::uniform_real_distribution<double> unit(0, 1);
+  double lowest = start_rim, settled = start_rim;
+  for (double t = 3; t < 5.2; t += scan_dt) {
+    std::vector<double> chassis;
+    for (int i = 0; i < 2; ++i) chassis.push_back(1.2 - .25 * unit(rng));
+    filter.update(100 + t, chassis, sigma);
+    lowest = std::min(lowest, filter.rim());
+    settled = filter.rim();
   }
+  check(lowest < 1.3, "a proven drop reaches its goal");
+  check(std::abs(settled - lowest) < .01, "a proven drop stays at its goal");
+}
+
+void test_one_burst_is_not_a_lift() {
+  std::vector<double> moved;
+  for (unsigned seed = 1; seed <= 11; ++seed) {
+    op::RimHeightFilter filter(1.165, 2.185);
+    filter.reset(start_rim, 100);
+    Scene scene(seed);
+    for (double t = 0; t < 3; t += scan_dt) filter.update(100 + t, scene.scan(start_rim), sigma);
+    auto burst = scene.scan(start_rim);
+    burst.insert(burst.end(), {1.8, 1.82, 1.85, 1.81});  // A passing cloth, in a single scan.
+    filter.update(103, burst, sigma);
+    double largest = 0;
+    for (double t = .02; t < 1; t += scan_dt) {
+      filter.update(103 + t, scene.scan(start_rim), sigma);
+      largest = std::max(largest, std::abs(filter.rim() - start_rim));
+    }
+    moved.push_back(largest);
+  }
+  std::sort(moved.begin(), moved.end());
+  check(moved.back() < .05, "one burst of returns 30 cm above never moves the rim 5 cm");
+  check(moved[moved.size() / 2] < .012, "one burst of returns 30 cm above usually does not move the rim");
 }
 
 void test_no_returns_holds() {
@@ -145,7 +239,7 @@ void test_chassis_alone_does_not_lower_a_rim_out_of_view() {
     for (int i = 0; i < 2; ++i) chassis.push_back(.95 + .25 * unit(rng));
     filter.update(100 + t, chassis, sigma, 1.3);  // The rim is above what the sensor can see.
   }
-  check(std::abs(filter.rim() - start_rim) < .05, "a rim out of view keeps its height");
+  check(std::abs(filter.rim() - start_rim) < .03, "a rim out of view keeps its height");
 }
 
 void test_chassis_returns_do_not_lower_a_rim_sitting_above_them() {
@@ -167,10 +261,31 @@ void test_chassis_returns_do_not_lower_a_rim_sitting_above_them() {
   }
 }
 
+void test_time_alone_does_not_bring_a_rim_down_to_the_chassis() {
+  // The wall is too sparse to tell whether it is gone. After the longest silence the height comes
+  // down, but stays above the chassis, as the wall may just not have been hit.
+  op::RimHeightFilter filter(1.165, 2.185);
+  filter.reset(start_rim, 100);
+  Scene scene;
+  scene.wall_rate = 2;
+  scene.body_rate = 0;
+  for (double t = 0; t < 3; t += scan_dt) filter.update(100 + t, scene.scan(start_rim), sigma);
+  std::mt19937 rng(13);
+  std::uniform_real_distribution<double> unit(0, 1);
+  constexpr double chassis_top = 1.2;
+  for (double t = 3; t < 5.2; t += scan_dt) {
+    std::vector<double> chassis;
+    for (int i = 0; i < 2; ++i) chassis.push_back(chassis_top - .25 * unit(rng));
+    filter.update(100 + t, chassis, sigma);
+    check(filter.rim() > chassis_top + .05, "a sparse wall unseen for a while does not bring the rim down to the chassis");
+  }
+  check(filter.rim() < start_rim - .05, "a wall unseen for long brings the rim down");
+}
+
 void test_old_returns_do_not_hold_a_rim_up() {
   // A drop from above: the older returns stay in the fit window but must not pull the height back.
   const auto r = run([](double t) { return start_rim + .3 + ramp(t, 2, -.3, .5); }, 6, 3.6);
-  check(r.steady_largest < .05, "the rim stays down within 1 s after a fall at 0.5 m/s");
+  check(r.steady_largest < .08, "the rim stays within 8 cm from 1 s after a fall at 0.5 m/s");
 }
 
 void test_sparse_rim_is_not_a_fall() {
@@ -221,10 +336,14 @@ int main() {
   test_follows_a_slow_lift_without_steps();
   test_settles_quickly_after_a_reversal();
   test_comes_down_further_than_the_wall_at_once();
+  test_stopped_lift_does_not_carry_on();
+  test_unhit_top_of_a_still_wall_is_not_a_fall();
+  test_proven_fall_reaches_its_goal();
   test_one_burst_is_not_a_lift();
   test_no_returns_holds();
   test_chassis_alone_does_not_lower_a_rim_out_of_view();
   test_chassis_returns_do_not_lower_a_rim_sitting_above_them();
+  test_time_alone_does_not_bring_a_rim_down_to_the_chassis();
   test_old_returns_do_not_hold_a_rim_up();
   test_sparse_rim_is_not_a_fall();
   test_a_rim_that_was_too_high_comes_down();

@@ -17,8 +17,8 @@ namespace lidar_perception_system::opening {
 //
 // The height moves only as far as the returns prove:
 // - The rim is at least as high as what two scans hit above it.
-// - It is lower only if enough returns stayed below that height, where the wall should have been
-//   hit too. How many are needed follows from how many land on the wall, at any range.
+// - It is lower only if the top of the wall stayed unhit for longer than the scan pattern explains.
+//   That time follows from how often the wall returns, at any range.
 // A line fitted to the recent returns refines the height between such proofs and gives its speed.
 // Sparse returns can mislead a fit, so on its own it may not move the height far. With no evidence
 // either way, the height stays where it is.
@@ -33,6 +33,7 @@ class RimHeightFilter {
     ready_ = false;
     returns_.clear();
     speed_ = 0;
+    slow_lift_ = false;
     goal_.reset();
   }
   // Start from a rim seen by a fit.
@@ -40,7 +41,7 @@ class RimHeightFilter {
     clear();
     ready_ = true;
     rim_ = seen_rim_ = std::clamp(rim, min_, max_);
-    stamp_ = last_top_hit_ = stamp;
+    stamp_ = stamp;
     fit_from_ = stamp - never_s;
     last_rise_ = last_fall_ = stamp - never_s;
   }
@@ -60,9 +61,10 @@ class RimHeightFilter {
     double rim = std::clamp(rim_ + speed_ * dt, seen_rim_ - carry_reach_m, seen_rim_ + carry_reach_m);
     rim = std::clamp(rim, min_, max_);
     // A speed needs fresh evidence of its own direction, as a lift can stop unseen.
-    if ((speed_ > 0 && stamp - last_rise_ > fresh_s) || (speed_ < 0 && stamp - last_fall_ > fresh_s))
+    if (!slow_lift_ && ((speed_ > 0 && stamp - last_rise_ > fresh_s) || (speed_ < 0 && stamp - last_fall_ > fresh_s)))
       speed_ *= std::exp(-dt / speed_fade_s);
-    add_returns(stamp, heights);
+    add_returns(stamp, heights, rim);
+    wall_rate_ = wall_rate(stamp);
     if (heights.empty()) {
       rim_ = rim;
       return;
@@ -70,18 +72,25 @@ class RimHeightFilter {
     const double margin = std::max(min_margin_m, margin_sigmas * sigma);
     const bool in_view = !ceiling || rim + view_margin_m < *ceiling;
     const Line carried{rim, speed_};
-    for (const double z : heights)
-      if (z > rim - top_hit_m && z <= rim + margin) {
-        seen_rim_ = rim;
-        last_rise_ = stamp;
-      }
+    // A return below the carried height only shows that the rim got as far as that return, and only
+    // one on the carried height confirms its speed. Otherwise a lift that stopped would carry on.
+    for (const double z : heights) {
+      if (z <= rim - top_hit_m || z > rim + margin) continue;
+      seen_rim_ = std::max(seen_rim_, std::min(z, rim));
+      if (z <= rim - margin) continue;
+      if (speed_ >= 0) last_rise_ = stamp;
+      if (speed_ <= 0) last_fall_ = stamp;
+    }
     // What rose long ago says nothing about now, and after a reversal it would keep the height up.
-    const double rise = proven_rise(carried, stamp, rise_window_s, margin, newest_s);
+    // Only what was hit shows how high the rim got. A rising speed would raise old returns too, and
+    // the rise they prove would then keep that speed up.
+    const double rise = proven_rise(Line{rim, std::min(speed_, 0.)}, stamp, rise_window_s, margin, newest_s);
     double fall = in_view ? proven_fall(carried, stamp, fall_window_s, margin, sigma, &fit_from_) : 0.;
-    if (rise <= 0 && fall <= 0 && in_view) fall = fall_after_silence(carried, stamp, margin);
+    if (rise <= 0 && fall <= 0 && in_view) fall = fall_after_silence(carried, stamp);
 
     int line_returns = 0;
-    const auto line = best_line(stamp, margin, sigma, in_view, &line_returns);
+    double line_window = 0;
+    const auto line = best_line(stamp, margin, sigma, in_view, &line_returns, &line_window);
     // Without proof, only a fit with enough returns close to the height may refine it. Limiting the
     // move instead of ignoring a distant fit would let the height creep towards the chassis.
     double target = rim;
@@ -108,10 +117,15 @@ class RimHeightFilter {
     const double step = (1 - std::exp(-dt / (goal_ ? proven_time_s : refine_time_s))) * (target - rim);
     const double reach = max_speed * dt + jump_margin_m;
     rim = std::clamp(rim + std::clamp(step, -reach, reach), min_, max_);
+    // The limit on carrying must follow a proven move, or it would hold it back before its goal.
+    if (proven || goal_) seen_rim_ = rim;
     if (goal_ && std::abs(*goal_ - rim) < goal_reached_m) goal_.reset();
-    if (proven) seen_rim_ = rim;
+    // A slow lift proves itself too rarely to keep a speed fresh, but many returns along a long line
+    // show it. A faster speed over so long a window would be that of a move that has already ended.
+    slow_lift_ = line && line_window >= slow_line_s && line_returns >= slow_line_returns &&
+                 std::abs(line->speed) >= slow_min_speed && std::abs(line->speed) <= slow_max_speed;
     if (line) {
-      const bool fresh = stamp - (line->speed > 0 ? last_rise_ : last_fall_) <= fresh_s;
+      const bool fresh = slow_lift_ || stamp - (line->speed > 0 ? last_rise_ : last_fall_) <= fresh_s;
       speed_ += (1 - std::exp(-dt / speed_time_s)) * ((fresh ? line->speed : 0.) - speed_);
     }
     rim_ = rim;
@@ -123,6 +137,7 @@ class RimHeightFilter {
   struct Return {
     double stamp, z;
     bool new_height;  // Not a repeat of a height already hit in the same scan.
+    bool on_wall;     // On the wall as the height stood when it came.
   };
   struct Line {
     double rim, speed;
@@ -140,23 +155,37 @@ class RimHeightFilter {
   // Band below the rim where the returns fall evenly on the wall. The floor and what is below it
   // return more densely, so they say nothing about how often the wall should have been hit.
   static constexpr double wall_band_m = .17;
-  // Log-odds needed to accept that a strip below the line has no wall, and the fewest returns and
-  // shortest time for that, as the returns of one sweep of the scan pattern are not independent.
-  static constexpr double fall_window_s = 3., fall_confidence = 2., fall_min_returns = 12, fall_min_span_s = .3;
+  // The scan pattern can leave the top of a still wall unhit for a while, measured on Unity and a
+  // real bag at 4-10 m. A strip this deep and this silent, in returns the wall gives over that time,
+  // is empty: confidence = silence * wall rate * (depth / wall band)^power. Returns within the silence
+  // are no measure of it, as one sweep of the pattern gives many.
+  static constexpr double fall_window_s = 3., fall_confidence = 9., fall_depth_power = .6;
+  static constexpr int fall_min_returns = 3;
+  // Shortest time the wall rate is taken over, so that it does not start out too high.
+  static constexpr double rate_min_span_s = 1.;
+  // A return this far above the height still counts as on the wall for the wall rate.
+  static constexpr double wall_top_m = .03;
   // Multiple of the expected gap between the rim and the highest return that the height stays above it.
   static constexpr double fall_gap_share = 2.;
   // One stroke of the scan pattern hits a height once, whatever the number of returns in this cell.
   static constexpr double height_cell_m = .01;
   // If nothing reaches the band at all while the robot still returns, the rim came down further.
+  // Beyond the longest silence it did even if the wall rate is too low to tell.
   static constexpr int silence_min_returns = 3;
-  static constexpr double min_silence_s = .25, max_silence_s = 1.5, silence_confidence = 6.;
+  static constexpr double min_silence_s = .25, max_silence_s = 2., silence_confidence = 9.;
+  // How far above the returns a fall on time alone stops. The wall must stay within reach of them,
+  // or too few would count as on the wall to prove anything from there.
+  static constexpr double unproven_gap_m = .085;
   // Time constants of a proven move and of refining, and how far a fit alone may refine.
   static constexpr double proven_time_s = .04, refine_time_s = .25, refine_reach_m = .03;
   static constexpr int refine_min_returns = 10;
   // How close a proven height counts as reached.
   static constexpr double goal_reached_m = .005;
   // Time a speed stays credible without evidence, and how far it can carry the height.
-  static constexpr double fresh_s = .4, speed_fade_s = .2, speed_time_s = .15, carry_reach_m = .04;
+  static constexpr double fresh_s = .2, speed_fade_s = .2, speed_time_s = .15, carry_reach_m = .04;
+  // Shortest window and fewest returns of a line that shows a slow lift, and the speeds of such a lift.
+  static constexpr double slow_line_s = 1.6, slow_min_speed = .06, slow_max_speed = .12;
+  static constexpr int slow_line_returns = 30;
   // A return this close below the rim hits it.
   static constexpr double top_hit_m = .04;
   // Candidate speeds of the rim, the band of returns a line is fitted to, and the fewest of them.
@@ -175,15 +204,22 @@ class RimHeightFilter {
   // An age older than anything the filter looks at.
   static constexpr double never_s = 1e3;
 
-  void add_returns(double stamp, const std::vector<double>& heights) {
+  void add_returns(double stamp, const std::vector<double>& heights, double rim) {
     cells_.clear();
     for (const double z : heights) {
       const long cell = std::lround(z / height_cell_m);
       const bool new_height = std::find(cells_.begin(), cells_.end(), cell) == cells_.end();
       if (new_height) cells_.push_back(cell);
-      returns_.push_back({stamp, z, new_height});
+      const bool on_wall = new_height && z <= rim + wall_top_m && z > rim - wall_band_m;
+      returns_.push_back({stamp, z, new_height, on_wall});
     }
     while (!returns_.empty() && stamp - returns_.front().stamp > return_window_s) returns_.pop_front();
+  }
+  // Returns per second on the wall over the recent past, its gaps included.
+  double wall_rate(double stamp) const {
+    if (returns_.empty()) return 0.;
+    const double on_wall = std::count_if(returns_.begin(), returns_.end(), [](const Return& r) { return r.on_wall; });
+    return on_wall / std::max(stamp - returns_.front().stamp, rate_min_span_s);
   }
   static double above_line(const Return& r, const Line& line, double stamp) {
     return r.z - (line.rim + line.speed * (r.stamp - stamp));
@@ -210,62 +246,70 @@ class RimHeightFilter {
     }
     return second > none ? second : 0.;
   }
-  // How far below the line the rim must be. Had the wall reached the line, a share of the returns
-  // on the wall below would have hit the strip in between.
+  // How far below the line the rim must be: the deepest strip under the line that has been silent
+  // for long enough. Walking back in time, each new highest return ends the silence of the strip above it.
   double proven_fall(const Line& line, double stamp, double window_s, double margin, double sigma,
                      double* since = nullptr) const {
-    double top = -std::numeric_limits<double>::infinity(), newest = top, count = 0, best = 0, from = 0;
+    constexpr double none = -std::numeric_limits<double>::infinity();
+    double top = none, count = 0, best = 0, from = 0;
+    const auto consider = [&](double silence_start) {
+      const double depth = -top - sigma;
+      if (top == none || count < fall_min_returns || depth <= 0) return;
+      const double silence = stamp - silence_start;
+      if (silence * wall_rate_ * std::pow(depth / wall_band_m, fall_depth_power) < fall_confidence) return;
+      // Stays above the highest return by the gap that the number of returns leaves open.
+      const double likely = -top - fall_gap_share * wall_band_m / count;
+      if (likely > best) {
+        best = likely;
+        from = silence_start;
+      }
+    };
+    double oldest = stamp;
+    bool stopped = false;
     for (auto it = returns_.rbegin(); it != returns_.rend() && stamp - it->stamp <= window_s; ++it) {
       const double d = above_line(*it, line, stamp);
-      if (d > margin) break;  // The rim was on or above the line by then.
-      if (d <= -wall_band_m) continue;
-      count += it->new_height;
-      top = std::max(top, d);
-      newest = std::max(newest, it->stamp);
-      if (count >= fall_min_returns && newest - it->stamp >= fall_min_span_s &&
-          count * (-top - sigma) / wall_band_m >= fall_confidence) {
-        // Stays above the highest return by the gap that the number of returns leaves open. Testing
-        // many windows on each scan raises the odds of a false alarm, and this keeps it small.
-        const double likely = -top - fall_gap_share * wall_band_m / count;
-        if (likely > best) {
-          best = likely;
-          from = it->stamp;
-        }
+      if (d > margin) {  // The rim was on or above the line by then.
+        consider(it->stamp);
+        stopped = true;
+        break;
       }
+      oldest = it->stamp;
+      if (d <= -wall_band_m) continue;
+      if (d > top) {
+        consider(it->stamp);
+        top = d;
+      }
+      count += it->new_height;
     }
+    if (!stopped) consider(oldest);
     // Older returns are from before it came down, and would only mislead a fit.
     if (since && best > refine_reach_m) *since = std::max(*since, from);
     return best;
   }
-  // Nothing near the line at all although the robot keeps returning, for longer than the rate of
-  // returns on the wall explains.
-  double fall_after_silence(const Line& line, double stamp, double margin) {
-    int wall = 0, under = 0;
-    for (const auto& r : returns_) {
-      const double d = above_line(r, line, stamp);
-      if (d <= margin && d > -wall_band_m) {
-        ++wall;
-        last_top_hit_ = std::max(last_top_hit_, r.stamp);
-      } else if (d <= -wall_band_m && stamp - r.stamp <= 1.) {
-        ++under;
-      }
-    }
-    const double silent = stamp - last_top_hit_;
-    const double rate = wall / return_window_s;
-    if (under < silence_min_returns ||
-        !(silent > max_silence_s || (silent > min_silence_s && rate * silent >= silence_confidence)))
-      return 0.;
+  // Nothing reaches the band at all although the robot keeps returning, for longer than the wall
+  // rate explains: it came down further than its wall reaches.
+  double fall_after_silence(const Line& line, double stamp) {
     scratch_.clear();
-    for (auto it = returns_.rbegin(); it != returns_.rend() && it->stamp > last_top_hit_; ++it)
+    double silence_start = returns_.empty() ? stamp : returns_.front().stamp;
+    for (auto it = returns_.rbegin(); it != returns_.rend(); ++it) {
+      if (above_line(*it, line, stamp) > -wall_band_m) {
+        silence_start = it->stamp;
+        break;
+      }
       scratch_.push_back(it->z);
-    if (scratch_.size() < 2) return 0.;
+    }
+    const double silence = stamp - silence_start;
+    const bool long_enough =
+        silence > max_silence_s || (silence > min_silence_s && silence * wall_rate_ >= silence_confidence);
+    if (!long_enough || static_cast<int>(scratch_.size()) < silence_min_returns) return 0.;
     std::nth_element(scratch_.begin(), scratch_.begin() + 1, scratch_.end(), std::greater<double>());
-    fit_from_ = std::max(fit_from_, last_top_hit_);
-    last_top_hit_ = stamp;
-    return std::max(line.rim - scratch_[1], 0.);
+    fit_from_ = std::max(fit_from_, silence_start);
+    // On time alone the wall may just not have been hit, so it stays as high as the returns allow.
+    const bool proven = silence * wall_rate_ >= silence_confidence;
+    return std::max(line.rim - (proven ? scratch_[1] : scratch_[1] + unproven_gap_m), 0.);
   }
   // The line over the longest window that the returns of no shorter window contradict.
-  std::optional<Line> best_line(double stamp, double margin, double sigma, bool in_view, int* returns) {
+  std::optional<Line> best_line(double stamp, double margin, double sigma, bool in_view, int* returns, double* window) {
     std::optional<Line> best;
     for (size_t k = 0; k < line_windows_s.size(); ++k) {
       int in_band = 0;
@@ -278,6 +322,7 @@ class RimHeightFilter {
       if (!consistent) continue;
       best = line;
       *returns = in_band;
+      *window = line_windows_s[k];
     }
     return best;
   }
@@ -300,9 +345,17 @@ class RimHeightFilter {
       window_.push_back(*it);
       top = std::max(top, it->z);
     }
+    // What a single scan hit above the rest proves nothing, as for a rise.
+    double top_stamp = -1;
+    for (const auto& r : window_)
+      if (r.z == top) top_stamp = r.stamp;
+    double top_of_others = -std::numeric_limits<double>::infinity();
+    for (const auto& r : window_)
+      if (r.stamp != top_stamp) top_of_others = std::max(top_of_others, r.z);
+    top = std::min(top, top_of_others + line_margin_m);
     // Only the upper part locates the rim. The chassis below it does not move with a lift.
     window_.erase(std::remove_if(window_.begin(), window_.end(),
-                                 [&](const Return& r) { return r.z < top - line_band_m; }),
+                                 [&](const Return& r) { return r.z < top - line_band_m || r.z > top; }),
                   window_.end());
     if (static_cast<int>(window_.size()) < line_min_returns) return std::nullopt;
     double newest_top = -std::numeric_limits<double>::infinity();
@@ -339,8 +392,8 @@ class RimHeightFilter {
   }
   double min_{0}, max_{0}, rim_{0}, speed_{0}, seen_rim_{0};
   std::optional<double> goal_;
-  double stamp_{0}, last_top_hit_{0}, last_rise_{0}, last_fall_{0}, fit_from_{0};
-  bool ready_{false};
+  double stamp_{0}, last_rise_{0}, last_fall_{0}, fit_from_{0}, wall_rate_{0};
+  bool ready_{false}, slow_lift_{false};
   std::deque<Return> returns_;
   std::vector<Return> window_;
   std::vector<double> detrended_, scratch_;
