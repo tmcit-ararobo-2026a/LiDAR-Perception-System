@@ -45,8 +45,10 @@ constexpr double unlearned_search_interval_s = .04;
 constexpr double top_frame_jump_rad = .35;
 // Share of the difference a top fit corrects in a known mount at each fit.
 constexpr double top_mount_gain_resting = .5, top_mount_gain_moving = .1;
-// Returns this far from the bucket axis can belong to the rim, given the wander of the pose.
-constexpr double rim_axis_margin_m = .08;
+// Returns this far from the bucket axis can belong to the rim. The mount is known only through the
+// pose of the chassis, which slides by tens of centimetres while it moves. Nothing else on the robot
+// reaches the rim, and static objects are already gone from the input, so the top stays clean.
+constexpr double rim_axis_margin_m = .35;
 // Scatter of a return's height: proportional to range, from the sensor's angular precision.
 constexpr double rim_height_noise_per_m = .0023, rim_height_noise_min_m = .005;
 // Republished scan windows repeat returns for this long, and only new ones count.
