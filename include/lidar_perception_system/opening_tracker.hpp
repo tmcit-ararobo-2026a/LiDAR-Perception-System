@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "lidar_perception_system/bucket_axis_filter.hpp"
 #include "lidar_perception_system/rim_height_filter.hpp"
 #include "lidar_perception_system/support_candidates.hpp"
 
@@ -190,6 +191,8 @@ struct Result {
   // The bucket height comes from the rim followed on every scan.
   bool bottom_height_tracked{false};
   double rim_height{0}, rim_speed{0};
+  // The horizontal position of the tracked bottom comes from the bucket itself, not the chassis pose.
+  bool bottom_axis_followed{false};
   TopFitStats top_fit;
   double bottom_observation_stamp{0};
   std::optional<Bottom> bottom;
@@ -304,6 +307,7 @@ class Tracker {
   std::deque<TopCeiling> top_ceilings_;
   std::deque<TopPose> top_poses_;
   RimHeightFilter rim_filter_;
+  BucketAxisFilter axis_filter_;
   std::unordered_map<VoxelKey, double, VoxelKeyHash> rim_recent_;
   std::optional<SensorView> sensor_view_;
   std::deque<PoseSample> pose_history_;

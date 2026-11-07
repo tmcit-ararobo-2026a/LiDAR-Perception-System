@@ -29,7 +29,7 @@ class BottomPoseFilter {
   void update(Eigen::Vector3d& center, Eigen::Vector3d& normal, double stamp,
               uint32_t id, double max_gap, bool confirmed_geometry = false,
               bool height_observed = true, bool xy_observed = true,
-              bool height_tracked = false) {
+              bool height_tracked = false, bool xy_followed = false) {
     const double dt = stamp - stamp_;
     const double previous_height = center_.z();
     const Eigen::Vector2d previous_xy = center_.head<2>();
@@ -190,6 +190,11 @@ class BottomPoseFilter {
         output_xy_ += output_velocity_ * step + .5 * acceleration * step * step;
         output_velocity_ += acceleration * step;
       }
+    }
+    // A followed axis is already filtered, and smoothing it again would only delay it.
+    if (xy_followed && !stationary_) {
+      output_xy_ = center_.head<2>() = center.head<2>().eval();
+      output_velocity_ = velocity_.head<2>();
     }
     ready_ = true;
     if (observations_.empty()) observations_.emplace_back(stamp, center);

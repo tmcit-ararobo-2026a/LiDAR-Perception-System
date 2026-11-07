@@ -623,8 +623,9 @@ class BucketTracker : public rclcpp::Node {
                                      r.bottom_tracking_mode == op::BottomMode::PlaneTracked,
                                  r.bottom_valid ||
                                      r.bottom_tracking_mode == op::BottomMode::ShapeFitted ||
-                                     r.bottom_tracking_mode == op::BottomMode::TopFitted,
-                                 r.bottom_height_tracked);
+                                     r.bottom_tracking_mode == op::BottomMode::TopFitted ||
+                                     r.bottom_axis_followed,
+                                 r.bottom_height_tracked, r.bottom_axis_followed);
       t.center = point(center);
       t.normal.x = normal.x();
       t.normal.y = normal.y();

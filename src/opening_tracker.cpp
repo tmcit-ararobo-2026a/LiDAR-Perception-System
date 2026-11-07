@@ -276,7 +276,9 @@ Tracker::Tracker(Config config)
     : cfg_(config),
       // The rulebook range, with room for the scatter of returns at its ends.
       rim_filter_(config.min_opening_z - config.bottom.height_tolerance,
-                  config.max_opening_z + config.bottom.height_tolerance + .05) {
+                  config.max_opening_z + config.bottom.height_tolerance + .05),
+      axis_filter_(config.body_min_z, config.body_max_z, config.bottom.bucket_height, config.nominal_radius,
+                   config.bottom.floor_radius, config.bottom.top_band_m) {
   cfg_.validate();
 }
 void Tracker::reset() {
@@ -295,6 +297,7 @@ void Tracker::clear_model() {
   top_poses_.clear();
   rim_filter_.clear();
   rim_recent_.clear();
+  axis_filter_.clear();
   pose_history_.clear();
   selected_.clear();
   accumulated_.clear();
@@ -1878,6 +1881,11 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
   }
   rebuild(stamp);
   follow_rim(upper, stamp, sensor_xy, result);
+  if (learned_bottom_ && rim_filter_.ready()) {
+    const Eigen::Vector2d inferred = pose_.world(learned_bottom_->center).head<2>();
+    if (!axis_filter_.ready()) axis_filter_.reset(inferred, stamp);
+    axis_filter_.update(stamp, filtered, sensor_xy, rim_filter_.rim(), inferred);
+  }
   remember_top_scan(upper, stamp);
   // The full height range is searched rarely: it is the most expensive step and
   // the mount height rarely changes. A contradiction is followed at the fast rate.
@@ -2062,6 +2070,12 @@ Result Tracker::process(const Points& map_points, double stamp, const Eigen::Vec
       cfg_.inside_field(pose_.world(learned_bottom_->center))) {
     result.tracked_bottom = learned_bottom_;
     result.bottom_tracking_observation_stamp = learned_bottom_stamp_;
+    // The mount turns with a chassis pose that may be tens of degrees off while the robot moves.
+    if (axis_filter_.ready()) {
+      const Eigen::Vector2d axis = axis_filter_.axis();
+      result.tracked_bottom->center.head<2>() = pose_.local({axis.x(), axis.y(), 0}).head<2>();
+      result.bottom_axis_followed = true;
+    }
     if (result.bottom_tracking_mode == BottomMode::BodyInferred) {
       result.tracked_bottom->current_points = 0;
       result.tracked_bottom->side_points = 0;
